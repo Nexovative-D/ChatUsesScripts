@@ -82,7 +82,7 @@ if not _is_admin():
     sys.exit(0)
 
 # ========================= VERSION & UPDATE CHECK =========================
-VERSION = "31.0.0"   # increment this with every release
+VERSION = "31.1.0"   # increment this with every release
 
 # Raw URL of version.json in your repo, and the page to send users to
 # when a newer version is available.
@@ -2113,6 +2113,7 @@ except ImportError:
 _update_splash(50, "Importing system libraries...")
 import threading
 import queue
+import collections
 import re
 try:
     import win32com.client
@@ -2123,7 +2124,6 @@ except ImportError:
     print("[Startup] pywin32 not installed — text-to-speech (SAPI) will be disabled. Run: pip install pywin32")
 import http.server
 import socketserver
-import json
 import urllib.request
 import urllib.error
 from tkinter import ttk, scrolledtext, messagebox
@@ -2333,10 +2333,18 @@ def execute_custom_command(trigger):
                 handle_mouse("click", args)
             elif action in ("rclick", "rightclick"):
                 handle_mouse("rclick", args)
+            elif action in ("mclick", "middleclick"):
+                handle_mouse("mclick", args)
             elif action in ("move", "mouse", "mv"):
                 handle_mouse("move", args)
             elif action in ("abs", "cursor", "moveabs"):
                 handle_mouse("abs", args)
+            elif action in ("drag", "dragrel"):
+                handle_mouse("drag", args)
+            elif action in ("dragabs", "drag_absolute"):
+                handle_mouse("dragabs", args)
+            elif action in ("holdclick", "holdrclick"):
+                handle_mouse(action, args)
             elif action in ("scroll", "wheel"):
                 handle_mouse("scroll", args)
             print(f"[CustomCmd]   → {action} {args}")
@@ -2690,88 +2698,126 @@ def _realpc_check_cooldown(username: str) -> bool:
 # Matching is case-insensitive and checked with whitespace fully stripped,
 # so spacing/chunking tricks don't bypass it.
 _REALPC_DANGEROUS_TEXT_PATTERNS_WITH_DESC = [
-    # Windows destructive / system commands
-    ("formatc", "Formats (wipes) the C: drive"),
-    ("formatd", "Formats (wipes) the D: drive"),
-    ("formate", "Formats (wipes) the E: drive"),
-    ("del/f", "Force-deletes files, bypassing the normal delete confirmation"),
-    ("del/s", "Deletes files recursively through subfolders"),
-    ("del/q", "Deletes files silently, no confirmation prompt"),
-    ("rd/s", "Deletes an entire folder and everything inside it"),
-    ("rmdir/s", "Deletes an entire folder and everything inside it"),
-    ("deltree", "Deletes an entire folder tree at once"),
-    ("diskpart", "Windows disk partitioning tool — can wipe/repartition drives"),
-    ("cleanall", "Diskpart command that wipes a drive completely"),
-    ("format", "Formats (wipes) a drive"),
-    ("\\\\.\\physicaldrive", "Direct raw access to a physical disk, bypassing normal file protections"),
-    ("/fs:ntfs", "Filesystem-format flag used together with 'format' to wipe a drive"),
-    ("/fs:fat32", "Filesystem-format flag used together with 'format' to wipe a drive"),
-    ("vssadmin", "Manages Windows shadow copies (backups) — can delete them"),
-    ("vssadminresize", "Shrinks shadow-copy storage, destroying backup history"),
-    # Power state — shutdown / restart / logoff, all forms
-    ("shutdown", "Turns the computer off"),
-    ("logoff", "Logs the current user out"),
-    ("restart-computer", "PowerShell command that reboots the machine"),
-    ("restart -computer", "PowerShell command that reboots the machine"),
-    ("restart–computer", "PowerShell command that reboots the machine (en-dash variant)"),
-    ("stop-computer", "PowerShell command that shuts the machine down"),
-    ("stop -computer", "PowerShell command that shuts the machine down"),
-    ("restart-service", "Restarts a Windows service, can disrupt anything running"),
-    ("stop-service", "Stops a Windows service, can disrupt anything running"),
-    ("shutdown.exe", "Turns the computer off"),
-    ("shutdown/r", "Reboots the computer"),
-    ("shutdown/s", "Shuts the computer down"),
-    ("shutdown-r", "Reboots the computer"),
-    ("shutdown-s", "Shuts the computer down"),
-    ("-computerlocalhost", "Targets the local machine in a WMI reboot/shutdown command"),
-    ("win32_operatingsystem", "WMI object used to trigger a remote-style reboot/shutdown"),
-    ("invoke-cimmethod", "Runs a low-level Windows management command — can reboot/shutdown"),
-    ("invoke-wmimethod", "Runs a low-level Windows management command — can reboot/shutdown"),
-    ("win32shutdown(", "Direct WMI call that shuts down or reboots the machine"),
-    ("bcdedit", "Edits Windows boot configuration — can break the ability to start up"),
-    ("bootrec", "Repairs/rewrites the Windows boot sector — can break startup if misused"),
-    ("regdelete", "Deletes a Windows Registry key — can break the OS"),
-    ("regadd", "Adds/changes a Windows Registry key — can break the OS or add malicious settings"),
-    ("regedit/s", "Silently imports a registry file with no confirmation prompt"),
-    ("netuser", "Creates/deletes/changes Windows user accounts"),
-    ("netlocalgroup", "Adds/removes users from admin or other local groups"),
-    ("netstop", "Stops a Windows service"),
-    ("vssadmindelete", "Permanently deletes Windows shadow-copy backups"),
-    ("wbadmindelete", "Permanently deletes Windows Backup system data"),
-    ("cipher/w", "Overwrites deleted file remnants — used to make data unrecoverable"),
-    ("taskkill/f", "Force-kills a running program with no warning"),
-    ("stop-process", "PowerShell command that force-kills a running program"),
-    ("kill-9", "Force-kills a running program immediately (Linux/macOS)"),
-    ("wmic", "Windows management command-line tool — can shut down, kill processes, etc."),
-    # PowerShell invocation / obfuscation / remote-exec tricks
-    ("powershell.exe", "Launches PowerShell, which can run almost any system command"),
-    ("powershell-", "Launches PowerShell with a flag/argument attached"),
-    ("pwsh.exe", "Launches PowerShell 7+ (cross-platform edition)"),
-    ("iwr(", "PowerShell shorthand for downloading a file/page from the internet"),
-    ("irm(", "PowerShell shorthand for downloading and often auto-running remote content"),
-    ("-encodedcommand", "Runs a PowerShell command hidden inside base64 encoding"),
-    ("-enc ", "Short form of -EncodedCommand — hides a PowerShell command in base64"),
-    ("-ec ", "Short form of -EncodedCommand — hides a PowerShell command in base64"),
-    ("executionpolicybypass", "Disables PowerShell's safety checks before running a script"),
-    ("windowstylehidden", "Runs a command with its window hidden from view"),
-    ("-windowstylehidden", "Runs a command with its window hidden from view"),
-    ("-noprofile", "Runs PowerShell stripped-down, often used to avoid logging/tracing"),
-    ("invoke-webrequest", "PowerShell command that downloads a file/page from the internet"),
-    ("invoke-expression", "Runs arbitrary text as a PowerShell command — classic malware technique"),
-    ("iex(", "Shorthand for Invoke-Expression — runs arbitrary text as a command"),
-    ("invoke-command", "Runs a command, optionally on a remote machine"),
-    ("downloadstring", "Downloads text/code from the internet directly into memory"),
-    ("downloadfile", "Downloads a file from the internet to disk"),
-    ("certutil-urlcache", "Abuses a Windows certificate tool to download files from the internet"),
-    ("certutil", "Windows certificate tool, commonly abused to download or decode files"),
-    ("mshta.exe", "Runs HTML/JavaScript applications with full system access"),
-    ("rundll32.exe", "Runs code from a DLL file — a very common way to launch hidden payloads"),
-    ("regsvr32", "Registers a DLL — can be abused to run malicious code while looking legitimate"),
-    ("regsvr32.exe", "Registers a DLL — can be abused to run malicious code while looking legitimate"),
-    ("wscript", "Runs VBScript/JScript files with full system access"),
-    ("wscript.exe", "Runs VBScript/JScript files with full system access"),
-    ("cscript", "Runs VBScript/JScript files from the command line"),
-    ("cscript.exe", "Runs VBScript/JScript files from the command line"),
+    # ============ Category: Disk & Filesystem ============
+    ("formatc", "Formats (wipes) the C: drive", "Disk & Filesystem"),
+    ("formatd", "Formats (wipes) the D: drive", "Disk & Filesystem"),
+    ("formate", "Formats (wipes) the E: drive", "Disk & Filesystem"),
+    ("del/f", "Force-deletes files, bypassing the normal delete confirmation", "Disk & Filesystem"),
+    ("del/s", "Deletes files recursively through subfolders", "Disk & Filesystem"),
+    ("del/q", "Deletes files silently, no confirmation prompt", "Disk & Filesystem"),
+    ("rd/s", "Deletes an entire folder and everything inside it", "Disk & Filesystem"),
+    ("rmdir/s", "Deletes an entire folder and everything inside it", "Disk & Filesystem"),
+    ("deltree", "Deletes an entire folder tree at once", "Disk & Filesystem"),
+    ("diskpart", "Windows disk partitioning tool — can wipe/repartition drives", "Disk & Filesystem"),
+    ("cleanall", "Diskpart command that wipes a drive completely", "Disk & Filesystem"),
+    ("format", "Formats (wipes) a drive", "Disk & Filesystem"),
+    ("\\\\.\\physicaldrive", "Direct raw access to a physical disk, bypassing normal file protections", "Disk & Filesystem"),
+    ("/fs:ntfs", "Filesystem-format flag used together with 'format' to wipe a drive", "Disk & Filesystem"),
+    ("/fs:fat32", "Filesystem-format flag used together with 'format' to wipe a drive", "Disk & Filesystem"),
+    ("vssadmin", "Manages Windows shadow copies (backups) — can delete them", "Disk & Filesystem"),
+    ("vssadminresize", "Shrinks shadow-copy storage, destroying backup history", "Disk & Filesystem"),
+    ("vssadmindelete", "Permanently deletes Windows shadow-copy backups", "Disk & Filesystem"),
+    ("wbadmindelete", "Permanently deletes Windows Backup system data", "Disk & Filesystem"),
+    ("cipher/w", "Overwrites deleted file remnants — used to make data unrecoverable", "Disk & Filesystem"),
+    ("icacls", "Changes file/folder permissions — can lock out or expose files", "Disk & Filesystem"),
+    ("takeown/f", "Force-takes ownership of a file/folder, bypassing normal permissions", "Disk & Filesystem"),
+    ("attrib+h", "Hides a file from normal view in File Explorer", "Disk & Filesystem"),
+    ("attrib-h", "Un-hides a hidden file", "Disk & Filesystem"),
+    # System32 / Windows directory protection — the single most common
+    # "instantly break the whole OS" target. Blocking the path itself
+    # catches it regardless of which tool is used to delete/move/rename
+    # it (del, PowerShell, robocopy, explorer.exe drag-and-drop via a
+    # scripted rename, etc.) — the earlier del/f, del/s, rd/s patterns
+    # above only catch it if the classic "del" command is used verbatim.
+    ("system32", "Targets Windows' core system folder — deleting/renaming it breaks the OS immediately", "Disk & Filesystem"),
+    ("windows\\system32", "Direct path to Windows' core system folder", "Disk & Filesystem"),
+    ("c:\\windows", "Targets the entire Windows installation folder", "Disk & Filesystem"),
+    ("%windir%", "Environment variable pointing to the Windows folder — used to target it indirectly", "Disk & Filesystem"),
+    ("%systemroot%", "Environment variable pointing to the Windows folder — used to target it indirectly", "Disk & Filesystem"),
+    ("remove-item", "PowerShell's delete command — can remove any file or folder, including system ones", "Disk & Filesystem"),
+    ("ri-recurse", "PowerShell shorthand for a recursive forced delete", "Disk & Filesystem"),
+    ("robocopy/purge", "Windows file-sync tool's delete mode — can wipe an entire folder's contents", "Disk & Filesystem"),
+    ("robocopymir", "Windows file-sync tool's 'mirror' mode — deletes anything not in the source, can empty a folder", "Disk & Filesystem"),
+    ("rename-item", "PowerShell's rename command — renaming System32 breaks Windows just as badly as deleting it", "Disk & Filesystem"),
+    ("move-item", "PowerShell's move command — moving System32 elsewhere breaks Windows just as badly as deleting it", "Disk & Filesystem"),
+    # Mount / volume-remapping tricks — these can expose or replace the C:
+    # drive out from under a running Windows install, effectively causing
+    # the same "everything is suddenly gone" outcome as a format, without
+    # ever calling a command with "format" in it.
+    ("mountvol", "Windows tool that assigns/removes drive letters — can unmount or remap C:", "Disk & Filesystem"),
+    ("mountvoly", "Windows tool that assigns/removes drive letters — can unmount or remap C:", "Disk & Filesystem"),
+    ("mountvol/d", "Removes a volume's drive letter, making it inaccessible", "Disk & Filesystem"),
+    ("mount-diskimage", "PowerShell command that mounts a disk image — can be used to swap in a different disk", "Disk & Filesystem"),
+    ("dismount-diskimage", "PowerShell command that unmounts a disk image", "Disk & Filesystem"),
+    ("set-disk", "PowerShell command that changes a disk's online/offline or read-only state", "Disk & Filesystem"),
+    ("set-partition", "PowerShell command that changes a partition's drive letter or state", "Disk & Filesystem"),
+    ("-isoffline", "PowerShell flag that takes a disk offline, making it disappear from the system", "Disk & Filesystem"),
+    ("get-diskset-disk", "PowerShell one-liner pattern used to take a disk offline/online", "Disk & Filesystem"),
+    ("remove-partitionaccesspath", "Removes a drive letter/mount path from a partition", "Disk & Filesystem"),
+    ("wsl--mount", "Mounts a physical disk into WSL/Linux, bypassing normal Windows file protections", "Disk & Filesystem"),
+    ("wslmount", "Mounts a physical disk into WSL/Linux, bypassing normal Windows file protections", "Disk & Filesystem"),
+    ("diskpartselectvolume", "Diskpart sub-command that targets a specific drive for further changes (assign/remove/format)", "Disk & Filesystem"),
+    ("diskpartremoveletter", "Diskpart sub-command that strips a drive letter, making the drive vanish from Explorer", "Disk & Filesystem"),
+    ("diskpartassignletter", "Diskpart sub-command that reassigns a drive letter — can redirect C: to a different disk", "Disk & Filesystem"),
+    ("diskpartoffline", "Diskpart sub-command that takes a disk offline", "Disk & Filesystem"),
+    ("diskpartclean", "Diskpart sub-command that wipes a disk's partition table", "Disk & Filesystem"),
+    # ============ Category: Power & System State ============
+    ("shutdown", "Turns the computer off", "Power & System State"),
+    ("logoff", "Logs the current user out", "Power & System State"),
+    ("restart-computer", "PowerShell command that reboots the machine", "Power & System State"),
+    ("restart -computer", "PowerShell command that reboots the machine", "Power & System State"),
+    ("restart–computer", "PowerShell command that reboots the machine (en-dash variant)", "Power & System State"),
+    ("stop-computer", "PowerShell command that shuts the machine down", "Power & System State"),
+    ("stop -computer", "PowerShell command that shuts the machine down", "Power & System State"),
+    ("restart-service", "Restarts a Windows service, can disrupt anything running", "Power & System State"),
+    ("stop-service", "Stops a Windows service, can disrupt anything running", "Power & System State"),
+    ("shutdown.exe", "Turns the computer off", "Power & System State"),
+    ("shutdown/r", "Reboots the computer", "Power & System State"),
+    ("shutdown/s", "Shuts the computer down", "Power & System State"),
+    ("shutdown-r", "Reboots the computer", "Power & System State"),
+    ("shutdown-s", "Shuts the computer down", "Power & System State"),
+    ("-computerlocalhost", "Targets the local machine in a WMI reboot/shutdown command", "Power & System State"),
+    ("win32_operatingsystem", "WMI object used to trigger a remote-style reboot/shutdown", "Power & System State"),
+    ("invoke-cimmethod", "Runs a low-level Windows management command — can reboot/shutdown", "Power & System State"),
+    ("invoke-wmimethod", "Runs a low-level Windows management command — can reboot/shutdown", "Power & System State"),
+    ("win32shutdown(", "Direct WMI call that shuts down or reboots the machine", "Power & System State"),
+    ("bcdedit", "Edits Windows boot configuration — can break the ability to start up", "Power & System State"),
+    ("bootrec", "Repairs/rewrites the Windows boot sector — can break startup if misused", "Power & System State"),
+    ("regdelete", "Deletes a Windows Registry key — can break the OS", "Power & System State"),
+    ("regadd", "Adds/changes a Windows Registry key — can break the OS or add malicious settings", "Power & System State"),
+    ("regedit/s", "Silently imports a registry file with no confirmation prompt", "Power & System State"),
+    ("netuser", "Creates/deletes/changes Windows user accounts", "Power & System State"),
+    ("netlocalgroup", "Adds/removes users from admin or other local groups", "Power & System State"),
+    ("netstop", "Stops a Windows service", "Power & System State"),
+    ("taskkill/f", "Force-kills a running program with no warning", "Power & System State"),
+    ("stop-process", "PowerShell command that force-kills a running program", "Power & System State"),
+    ("kill-9", "Force-kills a running program immediately (Linux/macOS)", "Power & System State"),
+    ("wmic", "Windows management command-line tool — can shut down, kill processes, etc.", "Power & System State"),
+    # ============ Category: PowerShell & Scripting ============
+    ("powershell.exe", "Launches PowerShell, which can run almost any system command", "PowerShell & Scripting"),
+    ("powershell-", "Launches PowerShell with a flag/argument attached", "PowerShell & Scripting"),
+    ("pwsh.exe", "Launches PowerShell 7+ (cross-platform edition)", "PowerShell & Scripting"),
+    ("iwr(", "PowerShell shorthand for downloading a file/page from the internet", "PowerShell & Scripting"),
+    ("irm(", "PowerShell shorthand for downloading and often auto-running remote content", "PowerShell & Scripting"),
+    ("-encodedcommand", "Runs a PowerShell command hidden inside base64 encoding", "PowerShell & Scripting"),
+    ("-enc ", "Short form of -EncodedCommand — hides a PowerShell command in base64", "PowerShell & Scripting"),
+    ("-ec ", "Short form of -EncodedCommand — hides a PowerShell command in base64", "PowerShell & Scripting"),
+    ("executionpolicybypass", "Disables PowerShell's safety checks before running a script", "PowerShell & Scripting"),
+    ("windowstylehidden", "Runs a command with its window hidden from view", "PowerShell & Scripting"),
+    ("-windowstylehidden", "Runs a command with its window hidden from view", "PowerShell & Scripting"),
+    ("-noprofile", "Runs PowerShell stripped-down, often used to avoid logging/tracing", "PowerShell & Scripting"),
+    ("invoke-webrequest", "PowerShell command that downloads a file/page from the internet", "PowerShell & Scripting"),
+    ("invoke-expression", "Runs arbitrary text as a PowerShell command — classic malware technique", "PowerShell & Scripting"),
+    ("iex(", "Shorthand for Invoke-Expression — runs arbitrary text as a command", "PowerShell & Scripting"),
+    ("invoke-command", "Runs a command, optionally on a remote machine", "PowerShell & Scripting"),
+    ("mshta.exe", "Runs HTML/JavaScript applications with full system access", "PowerShell & Scripting"),
+    ("rundll32.exe", "Runs code from a DLL file — a very common way to launch hidden payloads", "PowerShell & Scripting"),
+    ("regsvr32", "Registers a DLL — can be abused to run malicious code while looking legitimate", "PowerShell & Scripting"),
+    ("regsvr32.exe", "Registers a DLL — can be abused to run malicious code while looking legitimate", "PowerShell & Scripting"),
+    ("wscript", "Runs VBScript/JScript files with full system access", "PowerShell & Scripting"),
+    ("wscript.exe", "Runs VBScript/JScript files with full system access", "PowerShell & Scripting"),
+    ("cscript", "Runs VBScript/JScript files from the command line", "PowerShell & Scripting"),
+    ("cscript.exe", "Runs VBScript/JScript files from the command line", "PowerShell & Scripting"),
     # Script interpreters — a chat-controlled Real PC/VM bot has no
     # legitimate reason to invoke a general-purpose interpreter at all;
     # blocking the interpreter itself closes off whatever that language's
@@ -2782,96 +2828,104 @@ _REALPC_DANGEROUS_TEXT_PATTERNS_WITH_DESC = [
     # text and these patterns before comparing, so "python" alone already
     # matches "python.exe", "python3.exe", "python -c ...", etc. — no
     # need for separate entries per variant.
-    ("python", "Launches the Python interpreter — can run essentially any code"),
-    ("py.exe", "Windows' Python launcher — can run essentially any code"),
-    ("py-c", "Runs a one-line Python command directly from the command line"),
-    ("perl", "Launches the Perl interpreter — can run essentially any code"),
-    ("ruby", "Launches the Ruby interpreter — can run essentially any code"),
-    ("node.exe", "Launches Node.js (JavaScript) — can run essentially any code"),
-    ("node-e", "Runs a one-line Node.js command directly from the command line"),
-    ("attrib+h", "Hides a file from normal view in File Explorer"),
-    ("attrib-h", "Un-hides a hidden file"),
-    ("sc.exedelete", "Deletes a Windows service"),
-    ("sc.exestop", "Stops a Windows service"),
-    ("sc.execonfig", "Reconfigures a Windows service (e.g. to auto-run something)"),
-    ("sc.execreate", "Creates a new Windows service — a common persistence technique"),
-    ("icacls", "Changes file/folder permissions — can lock out or expose files"),
-    ("takeown/f", "Force-takes ownership of a file/folder, bypassing normal permissions"),
-    ("schtasks", "Schedules a task to run automatically — a common persistence technique"),
-    ("at.exe", "Old Windows task scheduler — same persistence risk as schtasks"),
-    ("disable-windowsdefender", "Turns off Windows' built-in antivirus"),
-    ("set-mppreference", "Changes Windows Defender antivirus settings"),
-    ("-disablerealtimemonitoring", "Turns off Windows Defender's real-time virus scanning"),
-    ("bitsadmin", "Windows background file-transfer tool, often abused to download malware"),
-    ("bitsadmin/transfer", "Downloads a file in the background using Windows' BITS service"),
-    ("msiexec", "Installs/runs an MSI installer package — can install unwanted software"),
-    ("msiexec/i", "Silently installs an MSI installer package"),
+    ("python", "Launches the Python interpreter — can run essentially any code", "PowerShell & Scripting"),
+    ("py.exe", "Windows' Python launcher — can run essentially any code", "PowerShell & Scripting"),
+    ("py-c", "Runs a one-line Python command directly from the command line", "PowerShell & Scripting"),
+    ("perl", "Launches the Perl interpreter — can run essentially any code", "PowerShell & Scripting"),
+    ("ruby", "Launches the Ruby interpreter — can run essentially any code", "PowerShell & Scripting"),
+    ("node.exe", "Launches Node.js (JavaScript) — can run essentially any code", "PowerShell & Scripting"),
+    ("node-e", "Runs a one-line Node.js command directly from the command line", "PowerShell & Scripting"),
+    # ============ Category: Persistence & Services ============
+    ("sc.exedelete", "Deletes a Windows service", "Persistence & Services"),
+    ("sc.exestop", "Stops a Windows service", "Persistence & Services"),
+    ("sc.execonfig", "Reconfigures a Windows service (e.g. to auto-run something)", "Persistence & Services"),
+    ("sc.execreate", "Creates a new Windows service — a common persistence technique", "Persistence & Services"),
+    ("schtasks", "Schedules a task to run automatically — a common persistence technique", "Persistence & Services"),
+    ("at.exe", "Old Windows task scheduler — same persistence risk as schtasks", "Persistence & Services"),
+    ("disable-windowsdefender", "Turns off Windows' built-in antivirus", "Persistence & Services"),
+    ("set-mppreference", "Changes Windows Defender antivirus settings", "Persistence & Services"),
+    ("-disablerealtimemonitoring", "Turns off Windows Defender's real-time virus scanning", "Persistence & Services"),
+    ("bitsadmin", "Windows background file-transfer tool, often abused to download malware", "Persistence & Services"),
+    ("bitsadmin/transfer", "Downloads a file in the background using Windows' BITS service", "Persistence & Services"),
+    ("msiexec", "Installs/runs an MSI installer package — can install unwanted software", "Persistence & Services"),
+    ("msiexec/i", "Silently installs an MSI installer package", "Persistence & Services"),
+    # ============ Category: Text-to-Speech Abuse ============
     # PowerShell / .NET text-to-speech — lets chat make the machine's own
     # voice say arbitrary text out loud (harassment / abuse vector, not a
     # destructive-command vector, but same "typed into the VM" risk surface)
-    ("system.speech", ".NET text-to-speech library — lets chat make the PC speak arbitrary text aloud"),
-    ("system.speech.synthesis", ".NET text-to-speech library — lets chat make the PC speak arbitrary text aloud"),
-    ("speechsynthesizer", ".NET text-to-speech object — lets chat make the PC speak arbitrary text aloud"),
-    ("sapi.spvoice", "Windows text-to-speech engine — lets chat make the PC speak arbitrary text aloud"),
-    ("spvoice", "Windows text-to-speech engine — lets chat make the PC speak arbitrary text aloud"),
-    ("createobject(\"sapi.spvoice\")", "Creates a text-to-speech object to make the PC speak arbitrary text"),
-    (".speak(", "Text-to-speech command — makes the PC say arbitrary/abusive text out loud"),
-    ("speak(", "Text-to-speech command — makes the PC say arbitrary/abusive text out loud"),
-    # Cross-platform / shell destructive commands
-    ("rm-rf", "Recursively force-deletes files/folders with no confirmation (Linux/macOS)"),
-    ("rm-r", "Recursively deletes files/folders (Linux/macOS)"),
-    ("sudorm", "Deletes files/folders with admin rights (Linux/macOS)"),
-    (":(){:|:&};:", "A 'fork bomb' — rapidly clones itself until the system crashes"),
-    ("mkfs", "Formats (wipes) a disk partition (Linux/macOS)"),
-    ("ddif=", "Low-level disk-copy command that can overwrite an entire drive"),
-    (">/dev/sda", "Redirects data to overwrite a raw disk device directly"),
-    ("chmod-r777", "Makes all files fully open to read/write/execute by anyone"),
-    ("chmod777/", "Makes files fully open to read/write/execute by anyone"),
-    ("sudodd", "Runs the disk-overwrite 'dd' command with admin rights"),
-    ("sudomkfs", "Formats (wipes) a disk partition with admin rights"),
-    ("sudoshutdown", "Shuts the computer down with admin rights (Linux/macOS)"),
-    ("sudoreboot", "Reboots the computer with admin rights (Linux/macOS)"),
-    ("sudohalt", "Halts the computer with admin rights (Linux/macOS)"),
-    ("sudopoweroff", "Powers off the computer with admin rights (Linux/macOS)"),
-    ("systemctlreboot", "Reboots the computer (Linux)"),
-    ("systemctlpoweroff", "Powers off the computer (Linux)"),
-    ("systemctlhalt", "Halts the computer (Linux)"),
-    ("sudoinit0", "Shuts the computer down via the old init system (Linux)"),
-    ("sudoinit6", "Reboots the computer via the old init system (Linux)"),
-    ("telinit0", "Shuts the computer down via the old init system (Linux)"),
-    ("telinit6", "Reboots the computer via the old init system (Linux)"),
-    # Generic dangerous download/exec chains
-    ("curlhttp", "Downloads content from a URL"),
-    ("wgethttp", "Downloads content from a URL"),
-    ("curl-o", "Downloads a file from the internet and saves it to disk"),
-    ("wget-o", "Downloads a file from the internet and saves it to disk"),
-    ("curl-s", "Downloads content silently, hiding progress/errors"),
-    ("|bash", "Pipes downloaded content straight into a shell to run it immediately"),
-    ("|sh", "Pipes downloaded content straight into a shell to run it immediately"),
+    ("system.speech", ".NET text-to-speech library — lets chat make the PC speak arbitrary text aloud", "Text-to-Speech Abuse"),
+    ("system.speech.synthesis", ".NET text-to-speech library — lets chat make the PC speak arbitrary text aloud", "Text-to-Speech Abuse"),
+    ("speechsynthesizer", ".NET text-to-speech object — lets chat make the PC speak arbitrary text aloud", "Text-to-Speech Abuse"),
+    ("sapi.spvoice", "Windows text-to-speech engine — lets chat make the PC speak arbitrary text aloud", "Text-to-Speech Abuse"),
+    ("spvoice", "Windows text-to-speech engine — lets chat make the PC speak arbitrary text aloud", "Text-to-Speech Abuse"),
+    ("createobject(\"sapi.spvoice\")", "Creates a text-to-speech object to make the PC speak arbitrary text", "Text-to-Speech Abuse"),
+    (".speak(", "Text-to-speech command — makes the PC say arbitrary/abusive text out loud", "Text-to-Speech Abuse"),
+    ("speak(", "Text-to-speech command — makes the PC say arbitrary/abusive text out loud", "Text-to-Speech Abuse"),
+    # ============ Category: Cross-Platform (Linux/macOS) ============
+    ("rm-rf", "Recursively force-deletes files/folders with no confirmation (Linux/macOS)", "Cross-Platform (Linux/macOS)"),
+    ("rm-r", "Recursively deletes files/folders (Linux/macOS)", "Cross-Platform (Linux/macOS)"),
+    ("sudorm", "Deletes files/folders with admin rights (Linux/macOS)", "Cross-Platform (Linux/macOS)"),
+    (":(){:|:&};:", "A 'fork bomb' — rapidly clones itself until the system crashes", "Cross-Platform (Linux/macOS)"),
+    ("mkfs", "Formats (wipes) a disk partition (Linux/macOS)", "Cross-Platform (Linux/macOS)"),
+    ("ddif=", "Low-level disk-copy command that can overwrite an entire drive", "Cross-Platform (Linux/macOS)"),
+    (">/dev/sda", "Redirects data to overwrite a raw disk device directly", "Cross-Platform (Linux/macOS)"),
+    ("chmod-r777", "Makes all files fully open to read/write/execute by anyone", "Cross-Platform (Linux/macOS)"),
+    ("chmod777/", "Makes files fully open to read/write/execute by anyone", "Cross-Platform (Linux/macOS)"),
+    ("sudodd", "Runs the disk-overwrite 'dd' command with admin rights", "Cross-Platform (Linux/macOS)"),
+    ("sudomkfs", "Formats (wipes) a disk partition with admin rights", "Cross-Platform (Linux/macOS)"),
+    ("sudoshutdown", "Shuts the computer down with admin rights (Linux/macOS)", "Cross-Platform (Linux/macOS)"),
+    ("sudoreboot", "Reboots the computer with admin rights (Linux/macOS)", "Cross-Platform (Linux/macOS)"),
+    ("sudohalt", "Halts the computer with admin rights (Linux/macOS)", "Cross-Platform (Linux/macOS)"),
+    ("sudopoweroff", "Powers off the computer with admin rights (Linux/macOS)", "Cross-Platform (Linux/macOS)"),
+    ("systemctlreboot", "Reboots the computer (Linux)", "Cross-Platform (Linux/macOS)"),
+    ("systemctlpoweroff", "Powers off the computer (Linux)", "Cross-Platform (Linux/macOS)"),
+    ("systemctlhalt", "Halts the computer (Linux)", "Cross-Platform (Linux/macOS)"),
+    ("sudoinit0", "Shuts the computer down via the old init system (Linux)", "Cross-Platform (Linux/macOS)"),
+    ("sudoinit6", "Reboots the computer via the old init system (Linux)", "Cross-Platform (Linux/macOS)"),
+    ("telinit0", "Shuts the computer down via the old init system (Linux)", "Cross-Platform (Linux/macOS)"),
+    ("telinit6", "Reboots the computer via the old init system (Linux)", "Cross-Platform (Linux/macOS)"),
+    ("mount/dev", "Mounts a raw disk device directly, bypassing normal filesystem protections (Linux/macOS)", "Cross-Platform (Linux/macOS)"),
+    ("sudomount", "Mounts a filesystem with admin rights (Linux/macOS)", "Cross-Platform (Linux/macOS)"),
+    ("umount-f", "Force-unmounts a filesystem, even if files on it are in use (Linux/macOS)", "Cross-Platform (Linux/macOS)"),
+    ("diskutilerasedisk", "Wipes and reformats an entire disk (macOS)", "Cross-Platform (Linux/macOS)"),
+    ("diskutilunmountdisk", "Unmounts an entire disk, including all its partitions (macOS)", "Cross-Platform (Linux/macOS)"),
+    # ============ Category: Download & Network Exec ============
+    ("curlhttp", "Downloads content from a URL", "Download & Network Exec"),
+    ("wgethttp", "Downloads content from a URL", "Download & Network Exec"),
+    ("curl-o", "Downloads a file from the internet and saves it to disk", "Download & Network Exec"),
+    ("wget-o", "Downloads a file from the internet and saves it to disk", "Download & Network Exec"),
+    ("curl-s", "Downloads content silently, hiding progress/errors", "Download & Network Exec"),
+    ("|bash", "Pipes downloaded content straight into a shell to run it immediately", "Download & Network Exec"),
+    ("|sh", "Pipes downloaded content straight into a shell to run it immediately", "Download & Network Exec"),
+    ("downloadstring", "Downloads text/code from the internet directly into memory", "Download & Network Exec"),
+    ("downloadfile", "Downloads a file from the internet to disk", "Download & Network Exec"),
+    ("certutil-urlcache", "Abuses a Windows certificate tool to download files from the internet", "Download & Network Exec"),
+    ("certutil", "Windows certificate tool, commonly abused to download or decode files", "Download & Network Exec"),
+    # ============ Category: Base64 Payload Decode ============
     # Base64 decode-to-file primitives — the actual "no internet needed"
     # vector: the payload (e.g. an image) is embedded as base64 text
     # directly in the typed command, then decoded straight to a file and
     # opened. None of this touches the network, so it's invisible to any
     # filter that only looks for download/exec commands.
-    ("frombase64string", "Decodes base64 text back into raw file data (e.g. a hidden image)"),
-    ("convert::frombase64string", "Decodes base64 text back into raw file data (e.g. a hidden image)"),
-    ("writeallbytes", "Writes raw decoded data straight to a file on disk"),
-    ("io.file::writeallbytes", "Writes raw decoded data straight to a file on disk"),
-    ("[io.file]::writeallbytes", "Writes raw decoded data straight to a file on disk"),
-    ("set-contentencoding", "Writes raw byte data to a file using PowerShell"),
-    ("-encodingbyte", "Flag that tells PowerShell to write raw byte data to a file"),
-    ("out-fileencoding", "Writes output to a file with a specific (often binary) encoding"),
-    ("certutil-decode", "Abuses a Windows certificate tool to decode base64 into a file"),
-    ("certreq-decode", "Abuses a Windows certificate tool to decode base64 into a file"),
+    ("frombase64string", "Decodes base64 text back into raw file data (e.g. a hidden image)", "Base64 Payload Decode"),
+    ("convert::frombase64string", "Decodes base64 text back into raw file data (e.g. a hidden image)", "Base64 Payload Decode"),
+    ("writeallbytes", "Writes raw decoded data straight to a file on disk", "Base64 Payload Decode"),
+    ("io.file::writeallbytes", "Writes raw decoded data straight to a file on disk", "Base64 Payload Decode"),
+    ("[io.file]::writeallbytes", "Writes raw decoded data straight to a file on disk", "Base64 Payload Decode"),
+    ("set-contentencoding", "Writes raw byte data to a file using PowerShell", "Base64 Payload Decode"),
+    ("-encodingbyte", "Flag that tells PowerShell to write raw byte data to a file", "Base64 Payload Decode"),
+    ("out-fileencoding", "Writes output to a file with a specific (often binary) encoding", "Base64 Payload Decode"),
+    ("certutil-decode", "Abuses a Windows certificate tool to decode base64 into a file", "Base64 Payload Decode"),
+    ("certreq-decode", "Abuses a Windows certificate tool to decode base64 into a file", "Base64 Payload Decode"),
     # Python equivalents of the above — belt-and-suspenders on top of the
     # interpreter block itself being blocked, in case "python" is ever
     # unblocked via the Danger Filter's per-pattern checkboxes.
-    ("base64.b64decode", "Python function that decodes base64 text back into raw file data"),
-    ("base64.decodebytes", "Python function that decodes base64 text back into raw file data"),
-    ("base64.decode", "Python function that decodes base64 text back into raw file data"),
-    ("importbase64", "Loads Python's base64 module, needed to decode a hidden payload"),
+    ("base64.b64decode", "Python function that decodes base64 text back into raw file data", "Base64 Payload Decode"),
+    ("base64.decodebytes", "Python function that decodes base64 text back into raw file data", "Base64 Payload Decode"),
+    ("base64.decode", "Python function that decodes base64 text back into raw file data", "Base64 Payload Decode"),
+    ("importbase64", "Loads Python's base64 module, needed to decode a hidden payload", "Base64 Payload Decode"),
 ]
-_REALPC_DANGEROUS_TEXT_PATTERNS = [p for p, _ in _REALPC_DANGEROUS_TEXT_PATTERNS_WITH_DESC]
+_REALPC_DANGEROUS_TEXT_PATTERNS = [p for p, _, _ in _REALPC_DANGEROUS_TEXT_PATTERNS_WITH_DESC]
 
 # Single keys that are dangerous as a standalone !key / !press regardless of
 # the typing buffer (they act immediately, not via typed text).
@@ -3444,6 +3498,7 @@ def _realpc_bot_loop():
         _realpc_set_status("Connection failed.")
         return
 
+    _dedup = _MessageDedup()
     _realpc_set_status("Listening — commands: !type  !send  !combo  !click  !move  etc.")
 
     while not _realpc_stop_event.is_set():
@@ -3454,6 +3509,8 @@ def _realpc_bot_loop():
             for msg_obj in chat.get_messages():
                 if _realpc_stop_event.is_set():
                     break
+                if _dedup.is_duplicate(msg_obj.id):
+                    continue
 
                 user = normalize_username(msg_obj.author_name)
                 msg  = msg_obj.text.strip()
@@ -4080,6 +4137,7 @@ def run_test_mode():
             elif cmd in ("click", "lclick", "rclick", "rightclick",
                          "mclick", "middleclick", "move", "mouse", "mv",
                          "abs", "cursor", "moveabs", "drag", "dragrel",
+                         "holdclick", "holdrclick",
                          "dragabs", "drag_absolute", "scroll", "wheel"):
                 handle_mouse(cmd, args)
             elif cmd in ("startvm", "launchvm"):
@@ -4883,6 +4941,35 @@ def unlock_session(session):
     if session.state == 2:   # 2 = Locked — only unlock when actually locked
         session.unlockMachine()
 
+_MOUSE_DEFAULT_STEP = 20     # px — same default !move used before named-direction distances existed
+_MOUSE_MAX_STEP = 500        # px — sanity cap so a typo like "!move up 99999" can't send an absurd jump
+
+def _both_look_like_ints(parts):
+    """True if both of a 2-element parts list parse as plain integers
+    (handles an optional leading '-' for negative relative deltas)."""
+    if len(parts) != 2:
+        return False
+    return all(p.lstrip('-').isdigit() for p in parts)
+
+def _parse_distance(raw):
+    """Parses an optional distance argument (e.g. the '50' in '!move up 50').
+    Falls back to _MOUSE_DEFAULT_STEP if missing/invalid, and clamps to
+    _MOUSE_MAX_STEP either way."""
+    if raw is None:
+        return _MOUSE_DEFAULT_STEP
+    try:
+        distance = int(raw)
+    except ValueError:
+        return _MOUSE_DEFAULT_STEP
+    return max(1, min(distance, _MOUSE_MAX_STEP))
+
+def _direction_to_delta(direction, distance):
+    """Converts a named direction ('left'/'right'/'up'/'down') + a pixel
+    distance into a (dx, dy) relative mouse-movement pair."""
+    dx = {'left': -distance, 'right': distance, 'up': 0, 'down': 0}.get(direction, 0)
+    dy = {'left': 0, 'right': 0, 'up': -distance, 'down': distance}.get(direction, 0)
+    return dx, dy
+
 def handle_mouse(cmd, args):
     session = None
     try:
@@ -4890,11 +4977,17 @@ def handle_mouse(cmd, args):
         parts   = args.split()
         buttons = 0
         if cmd in ['move', 'mouse', 'mv']:
-            if len(parts) == 2:
+            if len(parts) == 2 and _both_look_like_ints(parts):
+                # Raw relative dx,dy form — unchanged from before:
+                # "!move 500 300" nudges the cursor by (500, 300) px.
                 mouse.putMouseEvent(int(parts[0]), int(parts[1]), 0, 0, buttons)
-            elif args in ['left','right','up','down']:
-                dx = {'left':-20,'right':20,'up':0,'down':0}.get(args,0)
-                dy = {'left':0,'right':0,'up':-20,'down':20}.get(args,0)
+            elif parts and parts[0].lower() in ('left', 'right', 'up', 'down'):
+                # Named-direction form, now with an optional distance:
+                # "!move up" (defaults to 20px, same as before this change)
+                # "!move up 50" moves 50px in that direction.
+                direction = parts[0].lower()
+                distance = _parse_distance(parts[1] if len(parts) > 1 else None)
+                dx, dy = _direction_to_delta(direction, distance)
                 mouse.putMouseEvent(dx, dy, 0, 0, buttons)
         elif cmd in ['abs', 'cursor', 'moveabs']:
             if len(parts) == 2:
@@ -4921,6 +5014,23 @@ def handle_mouse(cmd, args):
                 mouse.putMouseEvent(0,0,0,0,button)
                 mouse.putMouseEvent(dx,dy,0,0,button)
                 mouse.putMouseEvent(0,0,0,0,0)
+        elif cmd in ['holdclick', 'holdrclick']:
+            # Named-direction click-and-drag: holds a mouse button down,
+            # moves the cursor by <distance> px in <direction>, then
+            # releases. Syntax: !holdclick <direction> <distance>
+            #   "!holdclick left 10"  -> hold LEFT button, drag 10px left, release
+            #   "!holdrclick down 30" -> hold RIGHT button, drag 30px down, release
+            # (functionally the same primitive as !drag/!dragrel above,
+            # just with human-readable direction names instead of raw
+            # dx/dy deltas)
+            if parts and parts[0].lower() in ('left', 'right', 'up', 'down'):
+                direction = parts[0].lower()
+                distance = _parse_distance(parts[1] if len(parts) > 1 else None)
+                dx, dy = _direction_to_delta(direction, distance)
+                button = 2 if cmd == 'holdrclick' else 1
+                mouse.putMouseEvent(0, 0, 0, 0, button)     # press
+                mouse.putMouseEvent(dx, dy, 0, 0, button)   # move while held
+                mouse.putMouseEvent(0, 0, 0, 0, 0)          # release
         elif cmd in ['dragabs', 'drag_absolute']:
             if len(parts) >= 2:
                 button = 1 if len(parts)==2 else (1 if parts[0]=='left' else 2 if parts[0]=='right' else 4)
@@ -5048,11 +5158,47 @@ def watchdog_restart():
             break
     print("[Watchdog] Stopped.")
 
+class _MessageDedup:
+    """
+    Tracks recently-seen chat message IDs so a message never triggers a
+    command twice. Needed because reconnecting to a chat backend
+    (periodic reconnect, or recovering from a dropped connection) often
+    re-delivers the last few seconds of messages that were already
+    processed right before the reconnect — this is normal behavior for
+    YouTube's live chat data, not a bug in any one backend, but without
+    a dedup layer it means commands can silently run twice in a row
+    right after every reconnect.
+    Bounded to MAX_TRACKED entries (oldest evicted first) so a
+    multi-hour stream doesn't grow this without limit.
+    """
+    MAX_TRACKED = 1000
+
+    def __init__(self):
+        self._seen_ids = set()
+        self._order = collections.deque()
+
+    def is_duplicate(self, msg_id) -> bool:
+        # Messages with no ID (some backends can occasionally omit one)
+        # can't be deduped by ID — fail open and let them through rather
+        # than risk silently dropping a legitimate command.
+        if not msg_id:
+            return False
+        if msg_id in self._seen_ids:
+            return True
+        self._seen_ids.add(msg_id)
+        self._order.append(msg_id)
+        if len(self._order) > self.MAX_TRACKED:
+            oldest = self._order.popleft()
+            self._seen_ids.discard(oldest)
+        return False
+
+
 class YouTubeChatBot:
     def __init__(self):
         self.video_id = VIDEO_ID
         self.chat = None
         self._reconnect_failures = 0
+        self._dedup = _MessageDedup()
         self.reconnect()
         update_overlay()
         threading.Thread(target=start_overlay_server, daemon=True).start()
@@ -5149,6 +5295,12 @@ class YouTubeChatBot:
                 for c in self.chat.get_messages():
                     if bot_stop_event.is_set():
                         break
+                    if self._dedup.is_duplicate(c.id):
+                        # Reconnects (periodic or after a dropped
+                        # connection) often re-deliver the last few
+                        # seconds of already-processed messages — skip
+                        # them so commands never fire twice in a row.
+                        continue
                     msg      = c.text.strip()
                     user     = normalize_username(c.author_name)
                     is_owner = c.is_owner
@@ -5271,6 +5423,7 @@ class YouTubeChatBot:
                                 print("[Bot] Fullscreen hint (manual)")
                             elif cmd in ['move','mouse','mv','abs','cursor','moveabs',
                                          'drag','dragrel','dragabs','drag_absolute',
+                                         'holdclick','holdrclick',
                                          'click','lclick','rclick','rightclick',
                                          'mclick','middleclick','scroll','wheel']:
                                 handle_mouse(cmd, args)
@@ -5541,6 +5694,7 @@ class YouTubeChatBotSecondary:
     def __init__(self, video_id: str):
         self.video_id = video_id
         self.chat = None
+        self._dedup = _MessageDedup()
         self._reconnect()
         print(f"[MultiStream] Secondary bot initialised: {video_id}")
 
@@ -5566,6 +5720,8 @@ class YouTubeChatBotSecondary:
                 for c in self.chat.get_messages():
                     if bot_stop_event.is_set():
                         break
+                    if self._dedup.is_duplicate(c.id):
+                        continue
                     msg  = c.text.strip()
                     user = normalize_username(c.author_name)
                     if user in banned_users and time.time() < banned_users[user]:
@@ -5623,6 +5779,7 @@ class YouTubeChatBotSecondary:
                             elif cmd in ('click', 'lclick', 'rclick', 'rightclick',
                                          'mclick', 'middleclick', 'move', 'mouse', 'mv',
                                          'abs', 'cursor', 'moveabs', 'drag', 'dragrel',
+                                         'holdclick', 'holdrclick',
                                          'dragabs', 'drag_absolute', 'scroll', 'wheel'):
                                 handle_mouse(cmd, args)
                         except Exception as e:
@@ -7433,13 +7590,15 @@ class NexovativeControlCenter:
         Real PC Control and the VM, since they share the same lists.
         Changes apply immediately (no restart needed) and persist to
         realpc_unblocked_patterns.json.
-        """
-        global _REALPC_UNBLOCKED_PATTERNS, _REALPC_UNBLOCKED_KEYS, _REALPC_BASE64_RULE_ENABLED
 
+        Includes a search box and category filter buttons so the ~180-
+        entry list is actually navigable instead of one long wall of
+        checkboxes.
+        """
         win = tk.Toplevel(self.root)
         win.title("🛡 Danger Filter — Blocked Commands")
         win.configure(bg=self.BG)
-        win.geometry("600x640")
+        win.geometry("640x700")
         win.transient(self.root)
 
         tk.Label(win, text="🛡 Danger Filter — Blocked Patterns",
@@ -7448,9 +7607,10 @@ class NexovativeControlCenter:
         tk.Label(win,
                  text="Checked = blocked (default). Uncheck anything you want to "
                       "allow through, then click Save. Applies to both Real PC "
-                      "Control and the VM immediately — no restart needed.",
+                      "Control and the VM immediately — no restart needed. "
+                      "Your checkbox choices are kept even while searching/filtering.",
                  bg=self.BG, fg=self.TEXTDIM, font=("Segoe UI", 9),
-                 wraplength=560, justify="left").pack(anchor="w", padx=14, pady=(0, 8))
+                 wraplength=600, justify="left").pack(anchor="w", padx=14, pady=(0, 8))
 
         # ── Bottom-anchored controls, packed BEFORE the scrollable list so
         # they always stay visible regardless of how long the list is. ──
@@ -7461,10 +7621,41 @@ class NexovativeControlCenter:
                                font=("Segoe UI", 9))
         status_lbl.pack(side="bottom", pady=(0, 4))
 
-        # Vars, created up front so Save/Select-All/Block-All can all see them
+        # Vars persist across re-renders (search/category changes just
+        # change which rows are drawn, never recreate the underlying
+        # BooleanVars) — so toggling a box, then searching for something
+        # else, then coming back never loses your change.
         pattern_vars = {}   # pattern -> BooleanVar (True = blocked)
         key_vars     = {}   # key -> BooleanVar
         base64_var   = tk.BooleanVar(value=_REALPC_BASE64_RULE_ENABLED)
+
+        _REALPC_DANGEROUS_KEYS_DESC = {
+            "delete": "Sends the Delete key — can remove selected files/text",
+            "del":    "Sends the Delete key — can remove selected files/text",
+            "printscreen": "Takes a screenshot to the clipboard — usually harmless, blocked as a precaution",
+        }
+        BASE64_CATEGORY = "Base64 Detection Rule"
+        KEYS_CATEGORY   = "Standalone Keys"
+
+        # Build the master row list ONCE: (category, label, desc, var)
+        all_rows = []
+        for p, desc, cat in _REALPC_DANGEROUS_TEXT_PATTERNS_WITH_DESC:
+            v = tk.BooleanVar(value=(p not in _REALPC_UNBLOCKED_PATTERNS))
+            pattern_vars[p] = v
+            all_rows.append((cat, p, desc, v))
+        for k in sorted(_REALPC_DANGEROUS_KEYS):
+            v = tk.BooleanVar(value=(k not in _REALPC_UNBLOCKED_KEYS))
+            key_vars[k] = v
+            all_rows.append((KEYS_CATEGORY, k, _REALPC_DANGEROUS_KEYS_DESC.get(k), v))
+        all_rows.append((BASE64_CATEGORY, "long base64 payload",
+            f"Blocks any unbroken run of {_REALPC_BASE64_BLOB_MIN_LEN}+ base64-alphabet "
+            f"characters that statistically looks like encoded binary data — e.g. an "
+            f"image or file smuggled in as text and decoded straight to disk.",
+            base64_var))
+
+        categories = ["All"] + sorted({row[0] for row in all_rows})
+        active_category = tk.StringVar(value="All")
+        search_var = tk.StringVar(value="")
 
         def _save_changes():
             global _REALPC_UNBLOCKED_PATTERNS, _REALPC_UNBLOCKED_KEYS, _REALPC_BASE64_RULE_ENABLED
@@ -7478,20 +7669,80 @@ class NexovativeControlCenter:
                      else "✅ Saved — everything is blocked (default).")
 
         def _select_all(state: bool):
-            for v in pattern_vars.values():
-                v.set(state)
-            for v in key_vars.values():
-                v.set(state)
-            base64_var.set(state)
+            # Only affects what's currently VISIBLE (respects search/category
+            # filter) — "Unblock All" while filtered to one category only
+            # unblocks that category, not the entire list. Use category
+            # "All" with an empty search to affect everything.
+            for cat, label, desc, var in all_rows:
+                if _row_matches_filter(cat, label, desc):
+                    var.set(state)
+            _render_rows()
 
         ttk.Button(btn_row, text="💾 Save Changes", style="Green.TButton",
                    command=_save_changes).pack(side="left")
-        ttk.Button(btn_row, text="Block All (reset)", style="Dim.TButton",
+        ttk.Button(btn_row, text="Block Shown (reset)", style="Dim.TButton",
                    command=lambda: _select_all(True)).pack(side="left", padx=(8, 0))
-        ttk.Button(btn_row, text="Unblock All", style="Dim.TButton",
+        ttk.Button(btn_row, text="Unblock Shown", style="Dim.TButton",
                    command=lambda: _select_all(False)).pack(side="left", padx=(8, 0))
         ttk.Button(btn_row, text="Close", style="Dim.TButton",
                    command=win.destroy).pack(side="right")
+
+        # ── Search bar ──
+        search_row = tk.Frame(win, bg=self.BG)
+        search_row.pack(fill="x", padx=14, pady=(0, 6))
+        tk.Label(search_row, text="🔎", bg=self.BG, fg=self.TEXTDIM,
+                 font=("Segoe UI", 10)).pack(side="left")
+        search_entry = ttk.Entry(search_row, textvariable=search_var, font=("Segoe UI", 9))
+        search_entry.pack(side="left", fill="x", expand=True, padx=(4, 0), ipady=3)
+
+        # ── Category filter buttons — single-row horizontal scroll strip ──
+        # (Auto-wrapping to multiple rows was tried and was unreliable —
+        # Tkinter's geometry timing made the wrap width calculation
+        # inconsistent. A fixed-height scrollable strip with explicit
+        # ◀/▶ buttons is simple and always works regardless of window
+        # size or how many categories exist.)
+        cat_outer = tk.Frame(win, bg=self.BG)
+        cat_outer.pack(fill="x", padx=14, pady=(0, 8))
+
+        cat_canvas = tk.Canvas(cat_outer, bg=self.BG, highlightthickness=0, height=34)
+        cat_inner = tk.Frame(cat_canvas, bg=self.BG)
+        cat_canvas.create_window((0, 0), window=cat_inner, anchor="nw")
+        cat_inner.bind(
+            "<Configure>",
+            lambda e: cat_canvas.configure(scrollregion=cat_canvas.bbox("all")))
+
+        def _scroll_categories(direction):
+            cat_canvas.xview_scroll(direction * 3, "units")
+
+        left_btn = ttk.Button(cat_outer, text="◀", width=3, style="Dim.TButton",
+                               command=lambda: _scroll_categories(-1))
+        right_btn = ttk.Button(cat_outer, text="▶", width=3, style="Dim.TButton",
+                                command=lambda: _scroll_categories(1))
+
+        left_btn.pack(side="left", padx=(0, 4))
+        cat_canvas.pack(side="left", fill="x", expand=True)
+        right_btn.pack(side="left", padx=(4, 0))
+
+        # Mouse wheel over the strip scrolls it sideways too, not just the arrows
+        def _on_cat_mousewheel(event):
+            cat_canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+        cat_canvas.bind("<Enter>", lambda e: cat_canvas.bind_all("<Shift-MouseWheel>", _on_cat_mousewheel))
+        cat_canvas.bind("<Leave>", lambda e: cat_canvas.unbind_all("<Shift-MouseWheel>"))
+
+        cat_buttons = {}
+
+        def _set_category(cat):
+            active_category.set(cat)
+            for c, btn in cat_buttons.items():
+                btn.configure(style="Accent.TButton" if c == cat else "Dim.TButton")
+            _render_rows()
+
+        for cat in categories:
+            b = ttk.Button(cat_inner, text=cat, style="Dim.TButton",
+                            command=lambda c=cat: _set_category(c))
+            b.pack(side="left", padx=(0, 4), pady=2)
+            cat_buttons[cat] = b
+        cat_buttons["All"].configure(style="Accent.TButton")
 
         # ── Scrollable checkbox list ──
         list_outer = tk.Frame(win, bg=self.BG2, highlightthickness=0)
@@ -7505,7 +7756,7 @@ class NexovativeControlCenter:
         list_frame.bind(
             "<Configure>",
             lambda e: list_canvas.configure(scrollregion=list_canvas.bbox("all")))
-        list_canvas.create_window((0, 0), window=list_frame, anchor="nw", width=560)
+        list_canvas.create_window((0, 0), window=list_frame, anchor="nw", width=600)
         list_canvas.configure(yscrollcommand=list_scrollbar.set)
         list_canvas.pack(side="left", fill="both", expand=True)
         list_scrollbar.pack(side="right", fill="y")
@@ -7528,38 +7779,41 @@ class NexovativeControlCenter:
                 bg=self.BG2, fg=self.TEXT, selectcolor=self.BG3,
                 activebackground=self.BG2, activeforeground=self.TEXT,
                 font=("Segoe UI Mono", 9, "bold"), anchor="w", justify="left",
-                wraplength=500)
+                wraplength=560)
             cb.pack(fill="x", anchor="w")
             if desc:
                 tk.Label(row, text=desc, bg=self.BG2, fg=self.TEXTDIM,
                          font=("Segoe UI", 8), anchor="w", justify="left",
-                         wraplength=490).pack(fill="x", padx=(24, 0))
+                         wraplength=550).pack(fill="x", padx=(24, 0))
 
-        _section_header(f"Text patterns ({len(_REALPC_DANGEROUS_TEXT_PATTERNS)}):")
-        for p, desc in _REALPC_DANGEROUS_TEXT_PATTERNS_WITH_DESC:
-            v = tk.BooleanVar(value=(p not in _REALPC_UNBLOCKED_PATTERNS))
-            pattern_vars[p] = v
-            _checkbox_row(p, v, desc)
+        def _row_matches_filter(cat, label, desc):
+            if active_category.get() != "All" and cat != active_category.get():
+                return False
+            q = search_var.get().strip().lower()
+            if not q:
+                return True
+            return q in label.lower() or (desc and q in desc.lower())
 
-        _REALPC_DANGEROUS_KEYS_DESC = {
-            "delete": "Sends the Delete key — can remove selected files/text",
-            "del":    "Sends the Delete key — can remove selected files/text",
-            "printscreen": "Takes a screenshot to the clipboard — usually harmless, blocked as a precaution",
-        }
-        _section_header(f"Standalone keys ({len(_REALPC_DANGEROUS_KEYS)}):")
-        for k in sorted(_REALPC_DANGEROUS_KEYS):
-            v = tk.BooleanVar(value=(k not in _REALPC_UNBLOCKED_KEYS))
-            key_vars[k] = v
-            _checkbox_row(k, v, _REALPC_DANGEROUS_KEYS_DESC.get(k))
+        def _render_rows(*_args):
+            for child in list_frame.winfo_children():
+                child.destroy()
 
-        _section_header("Base64 payload detection:")
-        _checkbox_row(
-            "long base64 payload",
-            base64_var,
-            f"Blocks any unbroken run of {_REALPC_BASE64_BLOB_MIN_LEN}+ base64-alphabet "
-            f"characters that statistically looks like encoded binary data — e.g. an "
-            f"image or file smuggled in as text and decoded straight to disk.")
+            shown = [row for row in all_rows if _row_matches_filter(*row[:3])]
+            if not shown:
+                tk.Label(list_frame, text="No patterns match your search.",
+                         bg=self.BG2, fg=self.TEXTDIM, font=("Segoe UI", 9)
+                         ).pack(padx=16, pady=20)
+                return
 
+            last_cat = None
+            for cat, label, desc, var in shown:
+                if cat != last_cat:
+                    _section_header(f"{cat} ({sum(1 for r in shown if r[0] == cat)}):")
+                    last_cat = cat
+                _checkbox_row(label, var, desc)
+
+        search_var.trace_add("write", _render_rows)
+        _render_rows()
 
     def _change_chat_backend(self):
         _show_chat_backend_dialog()   # blocks until the user picks something
