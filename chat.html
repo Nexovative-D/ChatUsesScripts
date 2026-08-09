@@ -136,6 +136,57 @@
             font-weight: 700;
         }
 
+        /* Cooldown countdown pills — shown above the chat feed while
+           !revert / !restart are on cooldown. Hidden entirely (not just
+           faded) when there's nothing to show, so they never take up
+           space or look like an empty placeholder. */
+        #cooldowns {
+            display: none;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 2px;
+        }
+
+        #cooldowns.visible { display: flex; }
+
+        .cooldown-pill {
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            font-family: 'Fira Code', monospace;
+            font-size: 11.5px;
+            font-weight: 500;
+            padding: 7px 12px;
+            border-radius: 8px;
+            letter-spacing: 0.2px;
+            background: rgba(14, 15, 18, 0.72);
+            border: 1px solid rgba(255, 255, 255, 0.07);
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.30);
+        }
+
+        .cooldown-pill.active { display: flex; }
+
+        .cooldown-pill .cd-label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .cooldown-pill .cd-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            box-shadow: 0 0 6px currentColor;
+        }
+
+        #cooldown-revert  { color: #38bfff; }
+        #cooldown-restart { color: #00e5a0; }
+
+        .cooldown-pill .cd-time {
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+        }
+
         @keyframes fadeSlideIn {
             0% {
                 opacity: 0;
@@ -150,6 +201,16 @@
 </head>
 <body>
     <div id="chat-container">
+        <div id="cooldowns">
+            <div class="cooldown-pill" id="cooldown-revert">
+                <span class="cd-label"><span class="cd-dot"></span>Revert cooldown</span>
+                <span class="cd-time" id="cooldown-revert-time">0s</span>
+            </div>
+            <div class="cooldown-pill" id="cooldown-restart">
+                <span class="cd-label"><span class="cd-dot"></span>Restart cooldown</span>
+                <span class="cd-time" id="cooldown-restart-time">0s</span>
+            </div>
+        </div>
         <div id="messages-list"></div>
         <div id="running-cmd"></div>
     </div>
@@ -164,6 +225,8 @@
                 if (!res.ok) return;
                 const data = await res.json();
                 if (!data?.chat) return;
+
+                updateCooldowns(data);
 
                 const cmdEl = document.getElementById('running-cmd');
                 if (data.running_command) {
@@ -214,6 +277,33 @@
                 .replace(/</g, "&lt;")
                 .replace(/>/g, "&gt;")
                 .replace(/"/g, "&quot;");
+        }
+
+        function formatSeconds(s) {
+            if (s >= 60) {
+                const m = Math.floor(s / 60);
+                const r = s % 60;
+                return `${m}m ${r}s`;
+            }
+            return `${s}s`;
+        }
+
+        function updateCooldowns(data) {
+            const revertSecs  = data.revert_cooldown_remaining  || 0;
+            const restartSecs = data.restart_cooldown_remaining || 0;
+
+            const revertPill  = document.getElementById('cooldown-revert');
+            const restartPill = document.getElementById('cooldown-restart');
+            const revertTime  = document.getElementById('cooldown-revert-time');
+            const restartTime = document.getElementById('cooldown-restart-time');
+            const wrap        = document.getElementById('cooldowns');
+
+            revertPill.classList.toggle('active', revertSecs > 0);
+            restartPill.classList.toggle('active', restartSecs > 0);
+            wrap.classList.toggle('visible', revertSecs > 0 || restartSecs > 0);
+
+            if (revertSecs > 0)  revertTime.textContent  = formatSeconds(revertSecs);
+            if (restartSecs > 0) restartTime.textContent = formatSeconds(restartSecs);
         }
 
         setInterval(refresh, 400);
