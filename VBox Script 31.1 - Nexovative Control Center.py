@@ -82,9 +82,9 @@ if not _is_admin():
     sys.exit(0)
 
 # ========================= VERSION & UPDATE CHECK =========================
-VERSION = "31.1.0"   # increment this with every release
+VERSION = "31.2.0"   # Version
 
-# Raw URL of version.json in your repo, and the page to send users to
+# Raw URL of version.json in the repo, and the page to send users to
 # when a newer version is available.
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/Nexovative-D/ChatUsesScripts/refs/heads/main/version.json"
 GITHUB_REPO_PAGE_URL = "https://github.com/Nexovative-D/ChatUsesScripts"
@@ -3242,6 +3242,11 @@ def _vm_keyboard_blocked(action: str, args: str, username: str) -> bool:
     if reason:
         print(f"[VM] BLOCKED ({reason}) — from {username}: !{action} {args!r}")
         _append_event("VM_BLOCKED", username, f"!{action} {args!r} — {reason}")
+        # Visible on the stream overlay too — otherwise a blocked command
+        # just silently does nothing from the viewer's perspective, which
+        # looks like the bot ignored their message rather than actively
+        # rejecting it.
+        update_status(f"🛡 Blocked command from {username}", transient=True)
         return True
     return False
 
@@ -5063,7 +5068,24 @@ def update_ban_vote_display(target, current_votes, required, remaining_time=None
     <script>setInterval(()=>location.reload(),10000);</script></body></html>"""
     with open(VOTE_FILE_BAN, "w", encoding="utf-8") as f: f.write(html)
 
-def update_status(message):
+_last_persistent_status = "Idle"
+_status_revert_timer = None
+_status_revert_lock = threading.Lock()
+
+def update_status(message, transient: bool = False, transient_seconds: float = 6.0):
+    """
+    Writes the current status to STATUS_FILE (the OBS status overlay).
+
+    transient=True is for short-lived alerts — cooldown hits, blocked
+    command notices — that should flash on the overlay for a few seconds
+    and then automatically revert back to whatever the real VM status
+    was, instead of permanently overwriting it (e.g. a blocked-command
+    notice should not get stuck showing forever in place of "Running").
+    Normal (non-transient) calls, like update_status("Running"), become
+    the new baseline that transient messages revert back to.
+    """
+    global _last_persistent_status, _status_revert_timer
+
     html = f"""<html><head><style>
     body{{background:rgba(0,0,0,0);color:white;font-family:Arial;font-size:32px;text-align:center;text-shadow:2px 2px 4px #000;}}
     #s{{margin-top:20px;padding:10px;background:rgba(0,0,0,0.4);border-radius:8px;display:inline-block;}}
@@ -5071,6 +5093,20 @@ def update_status(message):
     <script>setInterval(()=>location.reload(),10000);</script></body></html>"""
     with open(STATUS_FILE, "w", encoding="utf-8") as f: f.write(html)
     print(f"[Status] {message}")
+
+    with _status_revert_lock:
+        if _status_revert_timer:
+            _status_revert_timer.cancel()
+            _status_revert_timer = None
+
+        if transient:
+            def _revert():
+                update_status(_last_persistent_status)
+            _status_revert_timer = threading.Timer(transient_seconds, _revert)
+            _status_revert_timer.daemon = True
+            _status_revert_timer.start()
+        else:
+            _last_persistent_status = message
 
 def vote_timeout_checker():
     global restart_start_time, revert_start_time
@@ -5483,33 +5519,53 @@ class YouTubeChatBot:
                                     remaining_cd = int(restart_cooldown_until - current_time)
                                     print(f"[Vote] Restart on cooldown ({remaining_cd}s left)")
                                     _append_event("COOLDOWN", user, f"restart blocked — {remaining_cd}s left")
+                                    update_status(f"⏳ Restart on cooldown ({remaining_cd}s)", transient=True)
+                                    if _gui_app is not None:
+                                        try:
+                                            _gui_app._append_chat_system(f"⏳ Restart is on cooldown — {remaining_cd}s left.")
+                                        except Exception:
+                                            pass
                                     continue
+
+                                def _run_restart(triggered_by, votes_used, owner_bypass=False):
+                                    """Runs the actual VM reset in a background thread — see
+                                    _run_revert's docstring above for why (same reasoning
+                                    applies: keep reading chat while this is in progress,
+                                    and the cooldown is already set before this runs)."""
+                                    global restart_in_progress
+                                    try:
+                                        ok, err = retry_vbox(
+                                            lambda: subprocess.run([VBOXMANAGE_PATH,'controlvm',VM_NAME,'reset'], check=True),
+                                            attempts=3, delay=3, source=f"Vote/restart-{'owner' if owner_bypass else 'chat'}"
+                                        )
+                                        if ok:
+                                            update_status("Running"); play_success_sound()
+                                            play_event_sound("restart_sound")
+                                            _append_event("RESTART", triggered_by,
+                                                           "owner bypass" if owner_bypass else f"chat vote passed ({votes_used} votes)")
+                                            notify("VM Restarted",
+                                                   "Restart triggered by owner." if owner_bypass else "Restart vote passed by chat.")
+                                            if not owner_bypass:
+                                                obs_trigger("restart")
+                                                _stats["restarts"] += 1
+                                        else:
+                                            update_status("Restart failed")
+                                            log_error("Vote/restart", "Restart failed after retries", str(err))
+                                            notify("Restart Failed", str(err), timeout=6)
+                                    finally:
+                                        update_votes_json("restartvm", 0, required_votes, 0)
+                                        restart_in_progress = False
+
                                 # Owner bypass: skip vote, execute immediately
                                 if is_owner:
                                     print(f"[Vote] Restart bypassed by owner: {user}")
                                     speak_text("Restarting Virtual Machine...")
                                     vote_restart.clear(); restart_start_time=None; active_users.clear()
                                     restart_in_progress = True
+                                    restart_cooldown_until = time.time() + PERMISSIONS_CONFIG.get("action_cooldown", 60)
                                     update_status("Restarting...")
                                     update_votes_json("restartvm", required_votes, required_votes, 0)
-                                    try:
-                                        ok, err = retry_vbox(
-                                            lambda: subprocess.run([VBOXMANAGE_PATH,'controlvm',VM_NAME,'reset'], check=True),
-                                            attempts=3, delay=3, source="Vote/restart-owner"
-                                        )
-                                        if ok:
-                                            restart_cooldown_until = time.time() + PERMISSIONS_CONFIG.get("action_cooldown", 60)
-                                            update_status("Running"); play_success_sound()
-                                            play_event_sound("restart_sound")
-                                            _append_event("RESTART", user, "owner bypass")
-                                            notify("VM Restarted", "Restart triggered by owner.")
-                                        else:
-                                            update_status("Restart failed")
-                                            log_error("Vote/restart", "Owner restart failed after retries", str(err))
-                                            notify("Restart Failed", str(err), timeout=6)
-                                    finally:
-                                        update_votes_json("restartvm", 0, required_votes, 0)
-                                        restart_in_progress = False
+                                    threading.Thread(target=_run_restart, args=(user, required_votes, True), daemon=True).start()
                                     continue
                                 if not vote_restart: restart_start_time = current_time
                                 if user in vote_restart: continue
@@ -5522,27 +5578,9 @@ class YouTubeChatBot:
                                     speak_text("Restarting Virtual Machine...")
                                     vote_restart.clear(); restart_start_time=None; active_users.clear()
                                     restart_in_progress = True
+                                    restart_cooldown_until = time.time() + PERMISSIONS_CONFIG.get("action_cooldown", 60)
                                     update_status("Restarting...")
-                                    try:
-                                        ok, err = retry_vbox(
-                                            lambda: subprocess.run([VBOXMANAGE_PATH,'controlvm',VM_NAME,'reset'], check=True),
-                                            attempts=3, delay=3, source="Vote/restart-chat"
-                                        )
-                                        if ok:
-                                            restart_cooldown_until = time.time() + PERMISSIONS_CONFIG.get("action_cooldown", 60)
-                                            update_status("Running"); play_success_sound()
-                                            play_event_sound("restart_sound")
-                                            _append_event("RESTART", "vote", f"chat vote passed ({current} votes)")
-                                            notify("VM Restarted", "Restart vote passed by chat.")
-                                            obs_trigger("restart")
-                                            _stats["restarts"] += 1
-                                        else:
-                                            update_status("Restart failed")
-                                            log_error("Vote/restart", "Chat restart failed after retries", str(err))
-                                            notify("Restart Failed", str(err), timeout=6)
-                                    finally:
-                                        update_votes_json("restartvm", 0, required_votes, 0)
-                                        restart_in_progress = False
+                                    threading.Thread(target=_run_restart, args=("vote", current, False), daemon=True).start()
 
                             elif cmd == 'revert':
                                 if revert_in_progress: continue
@@ -5550,44 +5588,71 @@ class YouTubeChatBot:
                                     remaining_cd = int(revert_cooldown_until - current_time)
                                     print(f"[Vote] Revert on cooldown ({remaining_cd}s left)")
                                     _append_event("COOLDOWN", user, f"revert blocked — {remaining_cd}s left")
+                                    update_status(f"⏳ Revert on cooldown ({remaining_cd}s)", transient=True)
+                                    if _gui_app is not None:
+                                        try:
+                                            _gui_app._append_chat_system(f"⏳ Revert is on cooldown — {remaining_cd}s left.")
+                                        except Exception:
+                                            pass
                                     continue
+
+                                def _run_revert(triggered_by, votes_used, owner_bypass=False):
+                                    """
+                                    Runs the actual poweroff -> snapshot restore -> startvm
+                                    sequence in a background thread, so the bot keeps
+                                    reading/processing chat while a revert (which can
+                                    easily take 10s of seconds) is in progress — this is
+                                    also why the cooldown is set BEFORE this function is
+                                    even called, not after it finishes: a cooldown that
+                                    only started once the revert itself was done used to
+                                    silently stretch out by however long the revert took.
+                                    """
+                                    global revert_in_progress
+                                    try:
+                                        obs_trigger("revert_start")
+                                        ok, err = retry_vbox(
+                                            lambda: subprocess.run([VBOXMANAGE_PATH,'controlvm',VM_NAME,'poweroff'], check=True),
+                                            attempts=3, delay=3, source=f"Vote/revert-{'owner' if owner_bypass else 'chat'}/poweroff"
+                                        )
+                                        time.sleep(3)
+                                        ok2, err2 = retry_vbox(
+                                            lambda: subprocess.run([VBOXMANAGE_PATH,'snapshot',VM_NAME,'restorecurrent'], check=True),
+                                            attempts=3, delay=3, source=f"Vote/revert-{'owner' if owner_bypass else 'chat'}/snapshot"
+                                        )
+                                        time.sleep(3)
+                                        ok3, err3 = retry_vbox(
+                                            lambda: subprocess.run([VBOXMANAGE_PATH,'startvm',VM_NAME], check=True),
+                                            attempts=3, delay=4, source=f"Vote/revert-{'owner' if owner_bypass else 'chat'}/startvm"
+                                        )
+                                        if ok2 and ok3:
+                                            update_status("Running"); play_success_sound()
+                                            play_event_sound("revert_sound")
+                                            _append_event("REVERT", triggered_by,
+                                                           "owner bypass" if owner_bypass else f"chat vote passed ({votes_used} votes)")
+                                            notify("VM Reverted",
+                                                   "Snapshot restored by owner." if owner_bypass else "Snapshot restored by chat vote.")
+                                            obs_trigger("revert_done")
+                                            if not owner_bypass:
+                                                _stats["reverts"] += 1
+                                        else:
+                                            failed = "snapshot" if not ok2 else "startvm"
+                                            update_status("Revert failed")
+                                            log_error("Vote/revert", f"Revert failed at {failed}", str(err2 or err3))
+                                            notify("Revert Failed", f"Failed at {failed} step.", timeout=6)
+                                    finally:
+                                        update_votes_json("revert", 0, required_votes, 0)
+                                        revert_in_progress = False
+
                                 # Owner bypass: skip vote, execute immediately
                                 if is_owner:
                                     print(f"[Vote] Revert bypassed by owner: {user}")
                                     speak_text("Reverting Virtual Machine...")
                                     vote_revert.clear(); revert_start_time=None; active_users.clear()
                                     revert_in_progress = True
+                                    revert_cooldown_until = time.time() + PERMISSIONS_CONFIG.get("action_cooldown", 60)
                                     update_status("Reverting...")
                                     update_votes_json("revert", required_votes, required_votes, 0)
-                                    try:
-                                        ok, err = retry_vbox(
-                                            lambda: subprocess.run([VBOXMANAGE_PATH,'controlvm',VM_NAME,'poweroff'], check=True),
-                                            attempts=3, delay=3, source="Vote/revert-owner/poweroff"
-                                        )
-                                        time.sleep(3)
-                                        ok2, err2 = retry_vbox(
-                                            lambda: subprocess.run([VBOXMANAGE_PATH,'snapshot',VM_NAME,'restorecurrent'], check=True),
-                                            attempts=3, delay=3, source="Vote/revert-owner/snapshot"
-                                        )
-                                        time.sleep(3)
-                                        ok3, err3 = retry_vbox(
-                                            lambda: subprocess.run([VBOXMANAGE_PATH,'startvm',VM_NAME], check=True),
-                                            attempts=3, delay=4, source="Vote/revert-owner/startvm"
-                                        )
-                                        if ok2 and ok3:
-                                            revert_cooldown_until = time.time() + PERMISSIONS_CONFIG.get("action_cooldown", 60)
-                                            update_status("Running"); play_success_sound()
-                                            play_event_sound("revert_sound")
-                                            _append_event("REVERT", user, "owner bypass")
-                                            notify("VM Reverted", "Snapshot restored by owner.")
-                                        else:
-                                            failed = "snapshot" if not ok2 else "startvm"
-                                            update_status("Revert failed")
-                                            log_error("Vote/revert", f"Owner revert failed at {failed}", str(err2 or err3))
-                                            notify("Revert Failed", f"Failed at {failed} step.", timeout=6)
-                                    finally:
-                                        update_votes_json("revert", 0, required_votes, 0)
-                                        revert_in_progress = False
+                                    threading.Thread(target=_run_revert, args=(user, required_votes, True), daemon=True).start()
                                     continue
                                 if not vote_revert: revert_start_time = current_time
                                 if user in vote_revert: continue
@@ -5600,39 +5665,9 @@ class YouTubeChatBot:
                                     speak_text("Reverting Virtual Machine...")
                                     vote_revert.clear(); revert_start_time=None; active_users.clear()
                                     revert_in_progress = True
+                                    revert_cooldown_until = time.time() + PERMISSIONS_CONFIG.get("action_cooldown", 60)
                                     update_status("Reverting...")
-                                    obs_trigger("revert_start")
-                                    try:
-                                        ok, err = retry_vbox(
-                                            lambda: subprocess.run([VBOXMANAGE_PATH,'controlvm',VM_NAME,'poweroff'], check=True),
-                                            attempts=3, delay=3, source="Vote/revert-chat/poweroff"
-                                        )
-                                        time.sleep(3)
-                                        ok2, err2 = retry_vbox(
-                                            lambda: subprocess.run([VBOXMANAGE_PATH,'snapshot',VM_NAME,'restorecurrent'], check=True),
-                                            attempts=3, delay=3, source="Vote/revert-chat/snapshot"
-                                        )
-                                        time.sleep(3)
-                                        ok3, err3 = retry_vbox(
-                                            lambda: subprocess.run([VBOXMANAGE_PATH,'startvm',VM_NAME], check=True),
-                                            attempts=3, delay=4, source="Vote/revert-chat/startvm"
-                                        )
-                                        if ok2 and ok3:
-                                            revert_cooldown_until = time.time() + PERMISSIONS_CONFIG.get("action_cooldown", 60)
-                                            update_status("Running"); play_success_sound()
-                                            play_event_sound("revert_sound")
-                                            _append_event("REVERT", "vote", f"chat vote passed ({current} votes)")
-                                            notify("VM Reverted", "Snapshot restored by chat vote.")
-                                            obs_trigger("revert_done")
-                                            _stats["reverts"] += 1
-                                        else:
-                                            failed = "snapshot" if not ok2 else "startvm"
-                                            update_status("Revert failed")
-                                            log_error("Vote/revert", f"Chat revert failed at {failed}", str(err2 or err3))
-                                            notify("Revert Failed", f"Failed at {failed} step.", timeout=6)
-                                    finally:
-                                        update_votes_json("revert", 0, required_votes, 0)
-                                        revert_in_progress = False
+                                    threading.Thread(target=_run_revert, args=("vote", current, False), daemon=True).start()
 
                             elif cmd == 'ban':
                                 # Accept both "!ban @user" and "!ban user"
@@ -7803,6 +7838,7 @@ class NexovativeControlCenter:
                 tk.Label(list_frame, text="No patterns match your search.",
                          bg=self.BG2, fg=self.TEXTDIM, font=("Segoe UI", 9)
                          ).pack(padx=16, pady=20)
+                list_canvas.yview_moveto(0)
                 return
 
             last_cat = None
@@ -7811,6 +7847,16 @@ class NexovativeControlCenter:
                     _section_header(f"{cat} ({sum(1 for r in shown if r[0] == cat)}):")
                     last_cat = cat
                 _checkbox_row(label, var, desc)
+
+            # Reset scroll position to the top — otherwise switching to a
+            # new category (or typing a new search) while scrolled down
+            # in the previous list leaves you looking at whatever
+            # happened to be at that same scroll offset in the new list,
+            # which usually means it looks like the new category "starts"
+            # partway down or even empty.
+            list_frame.update_idletasks()
+            list_canvas.configure(scrollregion=list_canvas.bbox("all"))
+            list_canvas.yview_moveto(0)
 
         search_var.trace_add("write", _render_rows)
         _render_rows()
