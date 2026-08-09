@@ -143,8 +143,8 @@
         #cooldowns {
             display: none;
             flex-direction: column;
-            gap: 6px;
-            margin-bottom: 2px;
+            gap: 10px;
+            margin-bottom: 4px;
         }
 
         #cooldowns.visible { display: flex; }
@@ -154,14 +154,14 @@
             align-items: center;
             justify-content: space-between;
             font-family: 'Fira Code', monospace;
-            font-size: 11.5px;
-            font-weight: 500;
-            padding: 7px 12px;
-            border-radius: 8px;
+            font-size: 20px;
+            font-weight: 600;
+            padding: 14px 18px;
+            border-radius: 12px;
             letter-spacing: 0.2px;
-            background: rgba(14, 15, 18, 0.72);
-            border: 1px solid rgba(255, 255, 255, 0.07);
-            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.30);
+            background: rgba(14, 15, 18, 0.85);
+            border: 2px solid currentColor;
+            box-shadow: 0 4px 28px rgba(0, 0, 0, 0.45), 0 0 22px currentColor;
         }
 
         .cooldown-pill.active { display: flex; }
@@ -169,22 +169,33 @@
         .cooldown-pill .cd-label {
             display: flex;
             align-items: center;
-            gap: 6px;
+            gap: 10px;
+            color: #ffffff;
         }
 
         .cooldown-pill .cd-dot {
-            width: 6px;
-            height: 6px;
+            width: 12px;
+            height: 12px;
             border-radius: 50%;
-            box-shadow: 0 0 6px currentColor;
+            background: var(--cd-accent);
+            box-shadow: 0 0 10px var(--cd-accent);
+            flex-shrink: 0;
+            animation: pulseDot 1.2s ease-in-out infinite;
         }
 
-        #cooldown-revert  { color: #38bfff; }
-        #cooldown-restart { color: #00e5a0; }
+        @keyframes pulseDot {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50%      { opacity: 0.5; transform: scale(0.8); }
+        }
+
+        #cooldown-revert  { color: #38bfff; --cd-accent: #38bfff; }
+        #cooldown-restart { color: #00e5a0; --cd-accent: #00e5a0; }
 
         .cooldown-pill .cd-time {
-            font-weight: 700;
+            font-weight: 800;
+            font-size: 24px;
             font-variant-numeric: tabular-nums;
+            color: var(--cd-accent);
         }
 
         @keyframes fadeSlideIn {
