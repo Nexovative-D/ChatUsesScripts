@@ -7,6 +7,9 @@
 # VMware Script
 
 **pip install vncdotool pytchat**
+**Snapshot Name: snp**
+**VNC_PORT = 5900**
+**VNC_PASSWORD = "1234"**
 
 ----------------------------------------------------------------------------
 ## ⚠️ Why does my antivirus / a sandbox scanner flag this?
