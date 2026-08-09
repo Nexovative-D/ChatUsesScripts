@@ -82,9 +82,9 @@ if not _is_admin():
     sys.exit(0)
 
 # ========================= VERSION & UPDATE CHECK =========================
-VERSION = "31.2.0"   # Version
+VERSION = "31.3.0"   # increment this with every release
 
-# Raw URL of version.json in the repo, and the page to send users to
+# Raw URL of version.json in your repo, and the page to send users to
 # when a newer version is available.
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/Nexovative-D/ChatUsesScripts/refs/heads/main/version.json"
 GITHUB_REPO_PAGE_URL = "https://github.com/Nexovative-D/ChatUsesScripts"
@@ -2352,7 +2352,8 @@ def execute_custom_command(trigger):
             print(f"[CustomCmd] Step error ({action} {args}): {e}")
 
 # ========================= OVERLAY SYSTEM =========================
-overlay_data = {"chat": [], "running_command": "", "viewers": None, "likes": None, "subscribers": None}
+overlay_data = {"chat": [], "running_command": "", "viewers": None, "likes": None, "subscribers": None,
+                 "revert_cooldown_remaining": 0, "restart_cooldown_remaining": 0}
 seen_message_ids = set()
 last_write_time = 0
 
@@ -2370,6 +2371,19 @@ def update_overlay(author=None, message=None, running=None, msg_id=None):
             removed = overlay_data["chat"].pop(0)
             seen_message_ids.discard(removed.get("id"))
         changed = True
+    # Cooldown countdowns — read fresh every call so the overlay writer
+    # below (update_overlay_cooldowns) can push updates every second
+    # without needing its own separate JSON file or its own polling
+    # target in the browser; chat.html reads these straight out of the
+    # same overlay.json it's already fetching for chat messages.
+    revert_remaining = max(0, int(revert_cooldown_until - current_time))
+    restart_remaining = max(0, int(restart_cooldown_until - current_time))
+    if overlay_data.get("revert_cooldown_remaining") != revert_remaining:
+        overlay_data["revert_cooldown_remaining"] = revert_remaining
+        changed = True
+    if overlay_data.get("restart_cooldown_remaining") != restart_remaining:
+        overlay_data["restart_cooldown_remaining"] = restart_remaining
+        changed = True
     if changed and (current_time - last_write_time > 0.15):
         try:
             with open("overlay.json", "w", encoding="utf-8") as f:
@@ -2377,6 +2391,18 @@ def update_overlay(author=None, message=None, running=None, msg_id=None):
             last_write_time = current_time
         except Exception as e:
             print(f"[Overlay Error] {e}")
+
+def _cooldown_overlay_ticker():
+    """
+    Background thread: calls update_overlay() once a second purely so the
+    cooldown countdown fields stay fresh on overlay.json even when chat
+    is quiet (update_overlay is otherwise only called when a chat message
+    or running-command change happens). Started once at bot startup.
+    """
+    while not bot_stop_event.is_set():
+        update_overlay()
+        if bot_stop_event.wait(1.0):
+            break
 
 # def fetch_youtube_stats():
   #  """Background thread: polls YouTube Data API v3 every 30s for live viewer/like/subscriber counts."""
@@ -5317,6 +5343,7 @@ class YouTubeChatBot:
         last_reconnect   = time.time()
         RECONNECT_INTERVAL = 150
         print("[Bot] Waiting for chat messages...")
+        threading.Thread(target=_cooldown_overlay_ticker, daemon=True).start()
         while not bot_stop_event.is_set():
             if time.time() - last_reconnect > RECONNECT_INTERVAL:
                 print("[Bot] Periodic reconnect...")
@@ -6200,7 +6227,7 @@ class NexovativeControlCenter:
         nb.add(tab11, text="🔊 Sound")
         nb.add(tab12, text="🌐 Streams")
         nb.add(tab13, text="📅 Sched")
-        nb.add(tab14, text="🖱 Real PC")
+        nb.add(tab14, text="🖱 Real PC (BETA)")
         nb.add(tab15, text="🔄 Reconnect")
         nb.add(tab16, text="🤖 NexoAI")
         self._fun_tab_anchor = tab15   # hidden Fun tab (easter egg) is inserted right before this one
