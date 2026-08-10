@@ -82,7 +82,7 @@ if not _is_admin():
     sys.exit(0)
 
 # ========================= VERSION & UPDATE CHECK =========================
-VERSION = "31.3.0"   # increment this with every release
+VERSION = "31.4.0"   # increment this with every release
 
 # Raw URL of version.json in your repo, and the page to send users to
 # when a newer version is available.
@@ -3166,12 +3166,13 @@ def _realpc_is_dangerous(action: str, args: str, username: str):
         _realpc_buffer_reset(username)
         return f"dangerous command assembled across multiple steps: matched '{hit}'"
 
-    # Enter/Send submits the line in real life — clear buffer afterwards
-    # so unrelated future typing doesn't inherit old (safe) leftover text.
-    if action in ("enter", "send", "sendline", "typeenter"):
-        _realpc_buffer_reset(username)
-    elif action in ("key", "press") and text.strip().lower() in ("enter", "return", "tab", "esc", "escape"):
-        _realpc_buffer_reset(username)
+    # NOTE: buffer is intentionally NEVER reset just because Enter/Send/Tab
+    # was pressed — see the matching comment in _vm_is_dangerous for the
+    # full explanation. In short: Enter doesn't erase what's already on
+    # screen, so clearing the detection buffer on it let someone split a
+    # dangerous word around an Enter keypress to dodge detection while
+    # the full word still ended up on screen. The buffer now only ages
+    # out via its own length cap (_REALPC_BUFFER_MAX_LEN).
 
     return None
 
@@ -3247,10 +3248,17 @@ def _vm_is_dangerous(action: str, args: str, username: str):
         _vm_buffer_reset(username)
         return f"dangerous command assembled across multiple steps: matched '{hit}'"
 
-    if action in ("enter", "send", "sendline", "typeenter"):
-        _vm_buffer_reset(username)
-    elif action in ("key", "press") and text.strip().lower() in ("enter", "return", "tab", "esc", "escape"):
-        _vm_buffer_reset(username)
+    # NOTE: buffer is intentionally NEVER reset just because Enter/Send/Tab
+    # was pressed. Enter does not erase what's already been typed on the
+    # VM's screen — it submits it (in a shell) or moves to a new line
+    # (in an editor), either way the characters are still there or the
+    # command already ran. Resetting the detection buffer on Enter used
+    # to let someone spell out e.g. "shutdow" across several !type steps,
+    # press Enter (which cleared OUR buffer but not the VM's screen), then
+    # send the final "n" as if it were an unrelated one-character command
+    # — bypassing detection entirely while the full word sat right there
+    # on screen. The buffer now only ages out via its own length cap
+    # (_REALPC_BUFFER_MAX_LEN), same as any other typed text.
 
     return None
 
@@ -3271,8 +3279,10 @@ def _vm_keyboard_blocked(action: str, args: str, username: str) -> bool:
         # Visible on the stream overlay too — otherwise a blocked command
         # just silently does nothing from the viewer's perspective, which
         # looks like the bot ignored their message rather than actively
-        # rejecting it.
-        update_status(f"🛡 Blocked command from {username}", transient=True)
+        # rejecting it. No emoji here — status.html renders it as garbled
+        # symbols rather than the actual glyph.
+        update_status(f"Blocked command from {username}", transient=True, transient_seconds=10.0)
+        speak_text(f"Blocked command from {username}")
         return True
     return False
 
