@@ -140,7 +140,7 @@ if not _is_admin():
     sys.exit(0)
 
 # ========================= VERSION & UPDATE CHECK =========================
-VERSION = "31.5.0"   # increment this with every release
+VERSION = "31.6.0"   # increment this with every release
 
 # Raw URL of version.json in your repo, and the page to send users to
 # when a newer version is available.
@@ -2636,6 +2636,21 @@ def _vboxmanage_env_for_vm(vm_name):
     return env
 
 
+def _current_vbox_home():
+    """
+    Returns this process's own VBOX_USER_HOME directory, the same one
+    VBoxManage itself would use: the VBOX_USER_HOME env var if set,
+    otherwise the default `<profile>\\.VirtualBox`. Used to make sure the
+    current user's own VMs are never mistaken for another user's VMs
+    (see _discover_other_users_vbox_homes).
+    """
+    explicit = os.environ.get("VBOX_USER_HOME")
+    if explicit:
+        return os.path.normcase(os.path.normpath(explicit))
+    profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    return os.path.normcase(os.path.normpath(os.path.join(profile, ".VirtualBox")))
+
+
 def _discover_other_users_vbox_homes():
     """
     Finds every Windows user profile's VirtualBox config directory
@@ -2643,14 +2658,27 @@ def _discover_other_users_vbox_homes():
     other than the one running this script can also be listed. Requires
     admin rights to read other users' profile folders, which this app
     already has (see UAC elevation above).
+
+    Explicitly excludes the current user's own VirtualBox home — relying
+    only on `VBoxManage list vms` output to detect "already ours" is not
+    enough: if that call ever returns incomplete results (elevation
+    quirks, a slow VBoxSVC, etc.), the current user's own VMs would
+    otherwise be misidentified as belonging to another account, and later
+    commands would be run with an unnecessary VBOX_USER_HOME override —
+    which VirtualBox can treat as a different caller and refuse to hand
+    over the VM's session lock ("unexpected process has tried to lock
+    the machine").
     """
     homes = []
+    own_home = _current_vbox_home()
     try:
         users_root = os.path.join(os.environ.get("SystemDrive", "C:"), os.sep, "Users")
         if not os.path.isdir(users_root):
             return homes
         for entry in os.listdir(users_root):
             candidate = os.path.join(users_root, entry, ".VirtualBox")
+            if os.path.normcase(os.path.normpath(candidate)) == own_home:
+                continue
             xml_path = os.path.join(candidate, "VirtualBox.xml")
             if os.path.isfile(xml_path):
                 homes.append(candidate)
@@ -5061,7 +5089,63 @@ def speak_text(text):
             print(f"[Speech] Error: {e}")
     threading.Thread(target=_speak, daemon=True).start()
 
+_VM_STATE_CACHE = {}   # vm_name -> (state_str, last_checked_monotonic_time)
+_VM_STATE_CACHE_TTL = 1.0   # seconds — avoids hammering showvminfo once per scancode byte
+
+
+def _get_vm_state(vm_name):
+    """
+    Returns the current VMState string ('running', 'starting', 'poweroff',
+    etc.) for the given VM via `showvminfo --machinereadable`, or None if
+    it can't be determined. Cached briefly since callers like send_scancode
+    can otherwise call this once per keystroke.
+    """
+    now = time.monotonic()
+    cached = _VM_STATE_CACHE.get(vm_name)
+    if cached and (now - cached[1]) < _VM_STATE_CACHE_TTL:
+        return cached[0]
+    try:
+        result = _vbm_run(
+            ['showvminfo', vm_name, '--machinereadable'],
+            capture_output=True, text=True
+        )
+        lines = [l for l in result.stdout.splitlines() if l.startswith('VMState="')]
+        state = lines[0].split('=')[1].strip('"') if lines else None
+    except Exception:
+        state = None
+    _VM_STATE_CACHE[vm_name] = (state, now)
+    return state
+
+
+def _wait_until_vm_running(vm_name, timeout=2.0):
+    """
+    Returns True once the VM is confirmed 'running', False if it times
+    out first. VirtualBox only lets the process that launched the VM
+    hold its session lock until boot finishes (state goes from
+    'starting' to 'running') — any keyboardputstring/keyboardputscancode
+    call sent before that fails with E_ACCESSDENIED ("An unexpected
+    process has tried to lock the machine"). This short wait absorbs
+    the normal boot window instead of surfacing that error to chat
+    commands that arrive right as the VM is starting up.
+    """
+    if not vm_name:
+        return False
+    deadline = time.monotonic() + timeout
+    while True:
+        state = _get_vm_state(vm_name)
+        if state == "running":
+            return True
+        if state in (None, "poweroff", "aborted", "gurumeditation", "saved"):
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+
+
 def send_keyboard(text):
+    if not _wait_until_vm_running(VM_NAME):
+        print(f"[KB] Skipped — VM '{VM_NAME}' is not fully running yet (still booting or shutting down).")
+        return
     try:
         _vbm_run(['controlvm', VM_NAME, 'keyboardputstring', text], check=True)
         print(f"[KB] Typed: {text}")
@@ -5069,6 +5153,9 @@ def send_keyboard(text):
         print(f"[KB] Error: {e}")
 
 def send_scancode(scancode_str):
+    if not _wait_until_vm_running(VM_NAME):
+        print(f"[Scancode] Skipped — VM '{VM_NAME}' is not fully running yet (still booting or shutting down).")
+        return
     try:
         bytes_list = [scancode_str[i:i+2] for i in range(0, len(scancode_str), 2)]
         for byte in bytes_list:
