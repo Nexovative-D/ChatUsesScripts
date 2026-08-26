@@ -438,7 +438,7 @@ def _show_vboxapi_only_notice():
     dlg.title("")
     dlg.resizable(False, False)
     dlg.overrideredirect(True)
-    W, H = 460, 220
+    W = 460
     if SELECTED_MONITOR:
         sw, sh = SELECTED_MONITOR["width"], SELECTED_MONITOR["height"]
         mx, my = SELECTED_MONITOR["left"], SELECTED_MONITOR["top"]
@@ -446,9 +446,6 @@ def _show_vboxapi_only_notice():
         sw = dlg.winfo_screenwidth()
         sh = dlg.winfo_screenheight()
         mx, my = 0, 0
-    x = mx + (sw - W) // 2
-    y = my + (sh - H) // 2
-    dlg.geometry(f"{W}x{H}+{x}+{y}")
     dlg.configure(bg="#0f0f1a")
 
     border = tk.Frame(dlg, bg="#7c5cbf", padx=2, pady=2)
@@ -477,6 +474,16 @@ def _show_vboxapi_only_notice():
         width=14, height=1, cursor="hand2",
         command=dlg.destroy,
     ).pack(pady=(0, 10))
+
+    # Size the dialog to fit its actual content (the warning text can wrap
+    # to a different number of lines depending on font/DPI scaling), then
+    # re-center it. A fixed height here previously clipped the OK button
+    # off the bottom of the window whenever the text wrapped to 4+ lines.
+    dlg.update_idletasks()
+    H = inner.winfo_reqheight() + 4
+    x = mx + (sw - W) // 2
+    y = my + (sh - H) // 2
+    dlg.geometry(f"{W}x{H}+{x}+{y}")
 
     dlg.lift()
     dlg.attributes("-topmost", True)
