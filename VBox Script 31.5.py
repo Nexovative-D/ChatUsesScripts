@@ -103,9 +103,18 @@ def save_chat_backend_preference():
         print(f"[ChatBackendPref] Save error: {e}")
 
 
-# ========================= UAC ELEVATION =========================
-# If not already running as administrator, re-launch with ShellExecuteW
-# so Windows shows the UAC prompt. The original process exits immediately.
+# ========================= ADMIN PRIVILEGES (NOT REQUIRED) =========================
+# Historically this app re-launched itself with UAC elevation ("runas") to
+# write its overlay HTML files. That has been removed: running elevated
+# causes VBoxManage.exe (launched from this admin process) to lose visibility
+# into VMs that were started from a normal, non-elevated VirtualBox Manager
+# session — Windows isolates admin and standard-user processes from each
+# other at the COM/RPC level, so an elevated VBoxManage can see an
+# already-running VM as "aborted" or fail to find it at all, even though it
+# is clearly running in the normal-user VirtualBox Manager window. Running
+# this app without elevation avoids that mismatch entirely, and the overlay
+# HTML files it writes live in the script's own folder, which does not
+# require admin rights.
 def _is_admin():
     try:
         import ctypes
@@ -113,34 +122,9 @@ def _is_admin():
     except Exception:
         return False
 
-if not _is_admin():
-    import ctypes
-    # Show an explanation dialog before the UAC prompt so users are not alarmed.
-    # Use the Windows MessageBox API directly — tkinter is not yet initialised.
-    MB_YESNO        = 0x04
-    MB_ICONQUESTION = 0x20
-    IDYES           = 6
-    msg = (
-        "VirtualBox Chat Bot requires Administrator privileges.\n\n"
-        "Reason: Without admin rights, the bot cannot write the\n"
-        "overlay HTML files (vote status, OS vote, etc.).\n\n"
-        "Click Yes to continue, No to exit."
-    )
-    answer = ctypes.windll.user32.MessageBoxW(
-        0, msg, "Administrator Access Required", MB_YESNO | MB_ICONQUESTION
-    )
-    if answer != IDYES:
-        sys.exit(0)
-    # Re-launch with elevated privileges.
-    script = os.path.abspath(sys.argv[0])
-    params = " ".join(f'"{a}"' for a in sys.argv[1:])
-    ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable, f'"{script}" {params}', None, 1
-    )
-    sys.exit(0)
 
 # ========================= VERSION & UPDATE CHECK =========================
-VERSION = "31.6.0"   # increment this with every release
+VERSION = "31.5.0"   # increment this with every release
 
 # Raw URL of version.json in your repo, and the page to send users to
 # when a newer version is available.
@@ -2655,9 +2639,13 @@ def _discover_other_users_vbox_homes():
     """
     Finds every Windows user profile's VirtualBox config directory
     (normally C:\\Users\\<name>\\.VirtualBox), so VMs owned by accounts
-    other than the one running this script can also be listed. Requires
-    admin rights to read other users' profile folders, which this app
-    already has (see UAC elevation above).
+    other than the one running this script can also be listed. This app
+    no longer requires admin rights (see the note near _is_admin above),
+    so reading another user's profile folder here will typically fail
+    with a permissions error on a normal Windows setup — that's expected
+    and handled by the try/except below; it just means that account's
+    VMs won't be listed. The current user's own VMs are always listed
+    normally regardless of admin rights.
 
     Explicitly excludes the current user's own VirtualBox home — relying
     only on `VBoxManage list vms` output to detect "already ours" is not
@@ -2675,15 +2663,23 @@ def _discover_other_users_vbox_homes():
         users_root = os.path.join(os.environ.get("SystemDrive", "C:"), os.sep, "Users")
         if not os.path.isdir(users_root):
             return homes
-        for entry in os.listdir(users_root):
+        entries = os.listdir(users_root)
+    except Exception as e:
+        print(f"[VM List] Could not scan other user profiles: {e}")
+        return homes
+
+    for entry in entries:
+        try:
             candidate = os.path.join(users_root, entry, ".VirtualBox")
             if os.path.normcase(os.path.normpath(candidate)) == own_home:
                 continue
             xml_path = os.path.join(candidate, "VirtualBox.xml")
             if os.path.isfile(xml_path):
                 homes.append(candidate)
-    except Exception as e:
-        print(f"[VM List] Could not scan other user profiles: {e}")
+        except Exception:
+            # Without admin rights this is expected for most other users'
+            # profile folders — just skip that one and keep scanning.
+            continue
     return homes
 
 
@@ -2756,11 +2752,16 @@ def _vbm_run(args, **kwargs):
     nothing (VBoxManage otherwise only "sees" the current user's VMs).
     """
     env = kwargs.pop("env", None)
+    overridden_for = None
     if env is None:
         for a in args:
             if isinstance(a, str) and a in VM_OWNER_MAP:
                 env = _vboxmanage_env_for_vm(a)
+                overridden_for = a
                 break
+    if overridden_for:
+        print(f"[VBM] Running {args} with VBOX_USER_HOME override for "
+              f"'{overridden_for}' -> {VM_OWNER_MAP.get(overridden_for)}")
     return subprocess.run([VBOXMANAGE_PATH] + list(args), env=env, **kwargs)
 
 
@@ -3954,7 +3955,11 @@ def play_event_sound(event_key: str):
         return
     def _play():
         try:
-            subprocess.Popen(['start', sound_file], shell=True)
+            # os.startfile() asks Windows Shell to open the file directly —
+            # unlike subprocess.Popen(['start', ...], shell=True), which
+            # runs through cmd.exe and pops up a visible (empty) console
+            # window every time a sound plays.
+            os.startfile(sound_file)
         except Exception as err:
             print(f"[Sound] Error playing '{sound_file}': {err}")
     threading.Thread(target=_play, daemon=True).start()
@@ -4169,10 +4174,7 @@ def _run_scheduled_action(action: str, label: str):
                     attempts=3, delay=3, source="Scheduler/poweroff"
                 )
                 time.sleep(3)
-                ok2, _ = retry_vbox(
-                    lambda: _vbm_run(['snapshot', VM_NAME, 'restorecurrent'], check=True),
-                    attempts=3, delay=3, source="Scheduler/snapshot"
-                )
+                ok2, _ = restore_snapshot_with_recovery(VM_NAME, source="Scheduler")
                 time.sleep(3)
                 ok3, _ = retry_vbox(
                     lambda: _vbm_run(['startvm', VM_NAME], check=True),
@@ -4290,12 +4292,61 @@ def retry_vbox(fn, attempts=3, delay=3, source="VBox"):
         try:
             fn()
             return True, None
+        except subprocess.CalledProcessError as e:
+            # Surface VirtualBox's actual stderr message (e.g. "VM already
+            # running", "machine not found") instead of just the generic
+            # "returned non-zero exit status N" — the real cause is what
+            # tells a false failure (VM was already up) apart from a real one.
+            stderr_text = (e.stderr or "").strip() if hasattr(e, "stderr") else ""
+            last_exc = e
+            detail = f"{e} | stderr: {stderr_text}" if stderr_text else str(e)
+            log_error(source, f"Attempt {attempt}/{attempts} failed: {detail}")
+            if attempt < attempts:
+                time.sleep(delay)
         except Exception as e:
             last_exc = e
             log_error(source, f"Attempt {attempt}/{attempts} failed: {e}")
             if attempt < attempts:
                 time.sleep(delay)
     return False, last_exc
+
+
+def restore_snapshot_with_recovery(vm_name, source="Revert"):
+    """
+    Runs `VBoxManage snapshot <vm> restorecurrent`, with automatic recovery
+    if it fails. This is by far the most common way a revert's state gets
+    stuck: restorecurrent can fail (often reported as "the VM session was
+    aborted" or a similar session/lock error), leaving the VM in a broken
+    state that's hard to recover from by hand — reported to happen on
+    roughly 40% of reverts. When that happens, this discards the VM's
+    stuck saved/session state with `VBoxManage discardstate` and retries
+    restorecurrent once. Returns (success: bool, last_exception).
+    """
+    ok, err = retry_vbox(
+        lambda: _vbm_run(['snapshot', vm_name, 'restorecurrent'], check=True,
+                          capture_output=True, text=True),
+        attempts=2, delay=3, source=f"{source}/snapshot"
+    )
+    if ok:
+        return True, None
+
+    print(f"[{source}] restorecurrent failed for '{vm_name}', attempting "
+          f"discardstate recovery before retrying...")
+    discard_ok, discard_err = retry_vbox(
+        lambda: _vbm_run(['discardstate', vm_name], check=True,
+                          capture_output=True, text=True),
+        attempts=1, delay=0, source=f"{source}/discardstate"
+    )
+    print(f"[{source}] discardstate for '{vm_name}': "
+          f"{'ok' if discard_ok else f'failed ({discard_err})'}")
+
+    ok2, err2 = retry_vbox(
+        lambda: _vbm_run(['snapshot', vm_name, 'restorecurrent'], check=True,
+                          capture_output=True, text=True),
+        attempts=2, delay=3, source=f"{source}/snapshot-retry"
+    )
+    return ok2, (err2 or err)
+
 
 def _global_exception_handler(exc_type, exc_value, exc_tb):
     """Catch any otherwise-unhandled exception, log it and show a notification."""
@@ -5207,7 +5258,9 @@ def send_special_enter():
 
 def play_success_sound():
     try:
-        subprocess.Popen(['start', SUCCESS_SOUND_FILE], shell=True)
+        # os.startfile() avoids the empty cmd.exe window that
+        # subprocess.Popen(['start', ...], shell=True) pops up.
+        os.startfile(SUCCESS_SOUND_FILE)
     except Exception as e:
         print(f"[Sound] Error: {e}")
 
@@ -5456,6 +5509,12 @@ def watchdog_restart():
                 capture_output=True, text=True
             )
             lines = [l for l in result.stdout.splitlines() if l.startswith('VMState="')]
+            if not lines:
+                # showvminfo didn't return a VMState line at all — log the
+                # raw output once so the cause (VBoxManage error, VM not
+                # found, etc.) is visible instead of silently doing nothing.
+                print(f"[Watchdog] showvminfo returned no VMState line for '{VM_NAME}' "
+                      f"(exit={result.returncode}). stdout={result.stdout!r} stderr={result.stderr!r}")
             if lines:
                 vm_state = lines[0].split('=')[1].strip('"')
                 if vm_state in ["poweroff", "aborted", "gurumeditation"]:
@@ -5466,9 +5525,32 @@ def watchdog_restart():
                         update_status("Auto-starting...")
                         speak_text("Auto starting virtual machine...")
                         notify("VM Auto-Restarted", f"VM was found {vm_state}. Auto-restart triggered.")
+
+                        if vm_state == "aborted":
+                            # A VBoxManage/GUI session that ended abnormally
+                            # can leave the VM's saved-state/session lock in
+                            # a stuck "aborted" state — startvm then fails
+                            # with "The VM session was aborted" even though
+                            # VirtualBox Manager may still show it as
+                            # Running (stale GUI state). discardstate clears
+                            # that stuck state so the next startvm can
+                            # actually succeed. Best-effort: ignore failure
+                            # here, since the VM may genuinely have no saved
+                            # state to discard.
+                            discard_ok, discard_err = retry_vbox(
+                                lambda: _vbm_run(
+                                    ['discardstate', VM_NAME], check=True,
+                                    capture_output=True, text=True
+                                ),
+                                attempts=1, delay=0, source="Watchdog/discardstate"
+                            )
+                            print(f"[Watchdog] discardstate for '{VM_NAME}': "
+                                  f"{'ok' if discard_ok else f'skipped ({discard_err})'}")
+
                         ok, err = retry_vbox(
                             lambda: _vbm_run(
-                                ['startvm', VM_NAME], check=True
+                                ['startvm', VM_NAME], check=True,
+                                capture_output=True, text=True
                             ),
                             attempts=3, delay=5, source="Watchdog/startvm"
                         )
@@ -5911,9 +5993,8 @@ class YouTubeChatBot:
                                             attempts=3, delay=3, source=f"Vote/revert-{'owner' if owner_bypass else 'chat'}/poweroff"
                                         )
                                         time.sleep(3)
-                                        ok2, err2 = retry_vbox(
-                                            lambda: _vbm_run(['snapshot',VM_NAME,'restorecurrent'], check=True),
-                                            attempts=3, delay=3, source=f"Vote/revert-{'owner' if owner_bypass else 'chat'}/snapshot"
+                                        ok2, err2 = restore_snapshot_with_recovery(
+                                            VM_NAME, source=f"Vote/revert-{'owner' if owner_bypass else 'chat'}"
                                         )
                                         time.sleep(3)
                                         ok3, err3 = retry_vbox(
@@ -8356,7 +8437,9 @@ class NexovativeControlCenter:
                 update_status("Reverting...")
                 _vbm_run(['controlvm', VM_NAME, 'poweroff'], check=True)
                 time.sleep(3)
-                _vbm_run(['snapshot', VM_NAME, 'restorecurrent'], check=True)
+                ok_restore, err_restore = restore_snapshot_with_recovery(VM_NAME, source="GUI/revert")
+                if not ok_restore:
+                    raise (err_restore or RuntimeError("restorecurrent failed"))
                 time.sleep(3)
                 _vbm_run(['startvm', VM_NAME], check=True)
                 update_status("Running")
@@ -8662,7 +8745,9 @@ class NexovativeControlCenter:
                 try:
                     _vbm_run(['controlvm', VM_NAME, 'poweroff'], check=True)
                     time.sleep(3)
-                    _vbm_run(['snapshot', VM_NAME, 'restorecurrent'], check=True)
+                    ok_restore, err_restore = restore_snapshot_with_recovery(VM_NAME, source="Admin/revert")
+                    if not ok_restore:
+                        raise (err_restore or RuntimeError("restorecurrent failed"))
                     time.sleep(3)
                     _vbm_run(['startvm', VM_NAME], check=True)
                     update_status("Running")
@@ -9516,7 +9601,7 @@ class NexovativeControlCenter:
             def _test_sound(v=var):
                 f = v.get().strip()
                 if f:
-                    try: subprocess.Popen(['start', f], shell=True)
+                    try: os.startfile(f)
                     except Exception as e: messagebox.showerror("Error", str(e))
                 else:
                     messagebox.showinfo("No File", "No sound file configured for this event.")
