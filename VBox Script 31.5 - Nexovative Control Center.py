@@ -8,6 +8,64 @@ import sys
 import importlib.util as _importlib_util
 import json
 
+# ========================= DPI / DISPLAY SCALE AWARENESS =========================
+# Must run before any window is created (including the UAC MessageBoxW below
+# and the first tk.Tk()), otherwise Windows treats this process as DPI-unaware
+# and bitmap-stretches the whole app to match the monitor's scale setting
+# (e.g. 125%), which is what made everything look small/blurry on laptops
+# that ship with scaling enabled by default. SYSTEM_DPI_AWARE_VALUE holds the
+# raw pixels-per-inch value read back after the call, used later to scale the
+# Tk interpreter's own layout (fonts, widget sizes) to match.
+SYSTEM_DPI_AWARE_VALUE = 96   # 96 = 100% scale, Windows' baseline DPI
+
+
+def _make_process_dpi_aware():
+    global SYSTEM_DPI_AWARE_VALUE
+    try:
+        import ctypes
+        # Per-Monitor-V2 awareness (value 2) keeps the app crisp and lets it
+        # react correctly if the user drags it between monitors with
+        # different scale settings. Falls back to the older, coarser
+        # SetProcessDPIAware() on Windows versions that don't support it.
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+
+        # Read back the actual system DPI so the Tk scaling factor below is
+        # correct even at non-standard scale settings (125%, 150%, etc.).
+        try:
+            hdc = ctypes.windll.user32.GetDC(0)
+            LOGPIXELSX = 88
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, LOGPIXELSX)
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+            if dpi and dpi > 0:
+                SYSTEM_DPI_AWARE_VALUE = dpi
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[DPI] Could not set process DPI awareness: {e}")
+
+
+_make_process_dpi_aware()
+
+
+def _apply_tk_dpi_scaling(root):
+    """
+    Tells the Tk interpreter itself to scale fonts/widget geometry to match
+    the real Windows display scale, now that the process is DPI-aware.
+    Without this, Tk still assumes 96 DPI (100%) internally even though
+    Windows is no longer bitmap-stretching the window, so widgets and text
+    come out tiny again on a 125%+ display. Call once, right after the
+    first tk.Tk() is created.
+    """
+    try:
+        scale = SYSTEM_DPI_AWARE_VALUE / 72.0   # Tk's "scaling" unit is per 72 DPI
+        root.tk.call("tk", "scaling", scale)
+    except Exception as e:
+        print(f"[DPI] Could not apply Tk scaling: {e}")
+
+
 # Which backend the user wants YouTubeChatSource to use:
 #   "auto"            — try official (if key set) -> chat_downloader -> pytchat, in order (default)
 #   "official"        — official API only, no fallback
@@ -82,7 +140,7 @@ if not _is_admin():
     sys.exit(0)
 
 # ========================= VERSION & UPDATE CHECK =========================
-VERSION = "31.4.0"   # increment this with every release
+VERSION = "31.5.0"   # increment this with every release
 
 # Raw URL of version.json in your repo, and the page to send users to
 # when a newer version is available.
@@ -946,6 +1004,7 @@ def _create_splash():
     # All ttk styles will be registered on this interpreter.
     _host_root = tk.Tk()
     _host_root.withdraw()
+    _apply_tk_dpi_scaling(_host_root)   # match Tk's own scaling to the real Windows display scale
 
     monitors = _detect_monitors()
     _ask_monitor_choice(monitors)   # only actually prompts if more than one monitor was found
@@ -2549,21 +2608,127 @@ def get_vboxmanage_path():
             return path
     return None
 
-def get_vm_list():
-    """Fetches the VM list from VirtualBox."""
-    vbm = get_vboxmanage_path()
-    if not vbm:
-        return []
+VM_OWNER_MAP = {}   # vm_name -> VBOX_USER_HOME dir that owns it (populated by get_vm_list())
+
+
+def _vboxmanage_env_for_vm(vm_name):
+    """
+    Returns an environ dict for subprocess calls that must operate on the
+    given VM's own VirtualBox registry, so control commands (startvm,
+    controlvm, etc.) hit the correct user's VMs even when the app is
+    running under a different Windows account. Falls back to None
+    (caller should then use the default environment) if the VM's owner
+    is unknown, e.g. the current user's own VMs, which already work
+    without VBOX_USER_HOME set.
+    """
+    owner_home = VM_OWNER_MAP.get(vm_name)
+    if not owner_home:
+        return None
+    env = os.environ.copy()
+    env["VBOX_USER_HOME"] = owner_home
+    return env
+
+
+def _discover_other_users_vbox_homes():
+    """
+    Finds every Windows user profile's VirtualBox config directory
+    (normally C:\\Users\\<name>\\.VirtualBox), so VMs owned by accounts
+    other than the one running this script can also be listed. Requires
+    admin rights to read other users' profile folders, which this app
+    already has (see UAC elevation above).
+    """
+    homes = []
     try:
-        result = subprocess.run([vbm, "list", "vms"], capture_output=True, text=True)
-        # Each line: "VM Name" {uuid}
-        vms = re.findall(r'"([^"]+)"', result.stdout)
-        return vms
+        users_root = os.path.join(os.environ.get("SystemDrive", "C:"), os.sep, "Users")
+        if not os.path.isdir(users_root):
+            return homes
+        for entry in os.listdir(users_root):
+            candidate = os.path.join(users_root, entry, ".VirtualBox")
+            xml_path = os.path.join(candidate, "VirtualBox.xml")
+            if os.path.isfile(xml_path):
+                homes.append(candidate)
     except Exception as e:
-        print(f"[VM List] Error: {e}")
-        return []
+        print(f"[VM List] Could not scan other user profiles: {e}")
+    return homes
+
+
+def _vm_names_from_vbox_xml(vbox_home):
+    """
+    Parses VirtualBox.xml directly to list VM names registered under a
+    given VBOX_USER_HOME, without needing to run VBoxManage as that
+    other user. Returns a list of VM display names.
+    """
+    xml_path = os.path.join(vbox_home, "VirtualBox.xml")
+    names = []
+    try:
+        import xml.etree.ElementTree as _ET
+        tree = _ET.parse(xml_path)
+        root_el = tree.getroot()
+        for machine_el in root_el.iter():
+            tag = machine_el.tag.split("}")[-1]   # strip XML namespace
+            if tag == "MachineEntry":
+                src = machine_el.get("src", "")
+                if src:
+                    machine_name = os.path.splitext(os.path.basename(os.path.dirname(src)))[0]
+                    if machine_name:
+                        names.append(machine_name)
+    except Exception as e:
+        print(f"[VM List] Could not parse {xml_path}: {e}")
+    return names
+
+
+def get_vm_list():
+    """
+    Fetches the VM list from VirtualBox, merging VMs registered under the
+    current Windows user with VMs registered under every other Windows
+    user profile on this PC (so multi-user machines show every VM, not
+    just the ones belonging to the account the app happens to run as).
+    """
+    global VM_OWNER_MAP
+    VM_OWNER_MAP = {}
+    vbm = get_vboxmanage_path()
+    all_vms = []
+
+    if vbm:
+        try:
+            result = subprocess.run([vbm, "list", "vms"], capture_output=True, text=True)
+            # Each line: "VM Name" {uuid}
+            current_user_vms = re.findall(r'"([^"]+)"', result.stdout)
+            all_vms.extend(current_user_vms)
+        except Exception as e:
+            print(f"[VM List] Error: {e}")
+
+    seen = set(all_vms)
+    for vbox_home in _discover_other_users_vbox_homes():
+        for name in _vm_names_from_vbox_xml(vbox_home):
+            if name not in seen:
+                all_vms.append(name)
+                seen.add(name)
+                VM_OWNER_MAP[name] = vbox_home
+
+    return all_vms
 
 VBOXMANAGE_PATH = get_vboxmanage_path()
+
+
+def _vbm_run(args, **kwargs):
+    """
+    Drop-in replacement for subprocess.run([VBOXMANAGE_PATH, *args], ...).
+    If args contains a VM name that belongs to a different Windows user
+    (per VM_OWNER_MAP, populated by get_vm_list()), the call is made with
+    VBOX_USER_HOME pointed at that user's VirtualBox config, so the
+    command actually reaches that user's VM instead of silently doing
+    nothing (VBoxManage otherwise only "sees" the current user's VMs).
+    """
+    env = kwargs.pop("env", None)
+    if env is None:
+        for a in args:
+            if isinstance(a, str) and a in VM_OWNER_MAP:
+                env = _vboxmanage_env_for_vm(a)
+                break
+    return subprocess.run([VBOXMANAGE_PATH] + list(args), env=env, **kwargs)
+
+
 COOLDOWN_START  = 120
 VOTES_JSON_FILE = "votes.json"
 VOTE_FILE_BAN   = "ban_vote.html"
@@ -3965,17 +4130,17 @@ def _run_scheduled_action(action: str, label: str):
             speak_text("Scheduled revert starting...")
             try:
                 ok, _ = retry_vbox(
-                    lambda: subprocess.run([VBOXMANAGE_PATH, 'controlvm', VM_NAME, 'poweroff'], check=True),
+                    lambda: _vbm_run(['controlvm', VM_NAME, 'poweroff'], check=True),
                     attempts=3, delay=3, source="Scheduler/poweroff"
                 )
                 time.sleep(3)
                 ok2, _ = retry_vbox(
-                    lambda: subprocess.run([VBOXMANAGE_PATH, 'snapshot', VM_NAME, 'restorecurrent'], check=True),
+                    lambda: _vbm_run(['snapshot', VM_NAME, 'restorecurrent'], check=True),
                     attempts=3, delay=3, source="Scheduler/snapshot"
                 )
                 time.sleep(3)
                 ok3, _ = retry_vbox(
-                    lambda: subprocess.run([VBOXMANAGE_PATH, 'startvm', VM_NAME], check=True),
+                    lambda: _vbm_run(['startvm', VM_NAME], check=True),
                     attempts=3, delay=4, source="Scheduler/startvm"
                 )
                 if ok2 and ok3:
@@ -4000,7 +4165,7 @@ def _run_scheduled_action(action: str, label: str):
             speak_text("Scheduled restart starting...")
             try:
                 ok, _ = retry_vbox(
-                    lambda: subprocess.run([VBOXMANAGE_PATH, 'controlvm', VM_NAME, 'reset'], check=True),
+                    lambda: _vbm_run(['controlvm', VM_NAME, 'reset'], check=True),
                     attempts=3, delay=3, source="Scheduler/restart"
                 )
                 if ok:
@@ -4753,8 +4918,8 @@ def switch_os(target_entry, announce=True):
         # Step 1: power off the loser (best-effort, non-fatal)
         if current_os_vm and current_os_vm != target_vm:
             ok, err = retry_vbox(
-                lambda: subprocess.run(
-                    [VBOXMANAGE_PATH, 'controlvm', current_os_vm, 'poweroff'], check=True
+                lambda: _vbm_run(
+                    ['controlvm', current_os_vm, 'poweroff'], check=True
                 ),
                 attempts=3, delay=3, source="OSVoting/poweroff"
             )
@@ -4764,7 +4929,7 @@ def switch_os(target_entry, announce=True):
 
         # Step 2: start the winner
         ok, err = retry_vbox(
-            lambda: subprocess.run([VBOXMANAGE_PATH, 'startvm', target_vm], check=True),
+            lambda: _vbm_run(['startvm', target_vm], check=True),
             attempts=3, delay=4, source="OSVoting/startvm"
         )
 
@@ -4794,7 +4959,7 @@ def switch_os(target_entry, announce=True):
             update_status("OS switch failed — restoring previous OS...")
             if previous_vm and previous_vm != target_vm:
                 ok2, err2 = retry_vbox(
-                    lambda: subprocess.run([VBOXMANAGE_PATH, 'startvm', previous_vm], check=True),
+                    lambda: _vbm_run(['startvm', previous_vm], check=True),
                     attempts=3, delay=4, source="OSVoting/fallback"
                 )
                 if ok2:
@@ -4891,7 +5056,7 @@ def speak_text(text):
 
 def send_keyboard(text):
     try:
-        subprocess.run([VBOXMANAGE_PATH, 'controlvm', VM_NAME, 'keyboardputstring', text], check=True)
+        _vbm_run(['controlvm', VM_NAME, 'keyboardputstring', text], check=True)
         print(f"[KB] Typed: {text}")
     except Exception as e:
         print(f"[KB] Error: {e}")
@@ -4900,7 +5065,7 @@ def send_scancode(scancode_str):
     try:
         bytes_list = [scancode_str[i:i+2] for i in range(0, len(scancode_str), 2)]
         for byte in bytes_list:
-            subprocess.run([VBOXMANAGE_PATH, 'controlvm', VM_NAME, 'keyboardputscancode', byte], check=True)
+            _vbm_run(['controlvm', VM_NAME, 'keyboardputscancode', byte], check=True)
             time.sleep(0.008)
     except Exception as e:
         print(f"[Scancode] Error: {e}")
@@ -4955,7 +5120,7 @@ def play_success_sound():
 def start_vm():
     try:
         update_status("Starting...")
-        subprocess.run([VBOXMANAGE_PATH, 'startvm', VM_NAME], check=True)
+        _vbm_run(['startvm', VM_NAME], check=True)
         update_status("Running")
         print("[VM] Started!")
     except Exception as e:
@@ -4964,7 +5129,7 @@ def start_vm():
 
 def restore_window():
     try:
-        subprocess.run([VBOXMANAGE_PATH, 'controlvm', VM_NAME, 'gui', 'show'], check=True)
+        _vbm_run(['controlvm', VM_NAME, 'gui', 'show'], check=True)
         print("[VM] Window brought to front!")
     except:
         print("[VM] Restore: Not working in headless mode!")
@@ -5192,8 +5357,8 @@ def watchdog_restart():
                 if bot_stop_event.wait(10):
                     break
                 continue
-            result = subprocess.run(
-                [VBOXMANAGE_PATH, 'showvminfo', VM_NAME, '--machinereadable'],
+            result = _vbm_run(
+                ['showvminfo', VM_NAME, '--machinereadable'],
                 capture_output=True, text=True
             )
             lines = [l for l in result.stdout.splitlines() if l.startswith('VMState="')]
@@ -5208,8 +5373,8 @@ def watchdog_restart():
                         speak_text("Auto starting virtual machine...")
                         notify("VM Auto-Restarted", f"VM was found {vm_state}. Auto-restart triggered.")
                         ok, err = retry_vbox(
-                            lambda: subprocess.run(
-                                [VBOXMANAGE_PATH, 'startvm', VM_NAME], check=True
+                            lambda: _vbm_run(
+                                ['startvm', VM_NAME], check=True
                             ),
                             attempts=3, delay=5, source="Watchdog/startvm"
                         )
@@ -5572,7 +5737,7 @@ class YouTubeChatBot:
                                     global restart_in_progress
                                     try:
                                         ok, err = retry_vbox(
-                                            lambda: subprocess.run([VBOXMANAGE_PATH,'controlvm',VM_NAME,'reset'], check=True),
+                                            lambda: _vbm_run(['controlvm',VM_NAME,'reset'], check=True),
                                             attempts=3, delay=3, source=f"Vote/restart-{'owner' if owner_bypass else 'chat'}"
                                         )
                                         if ok:
@@ -5648,17 +5813,17 @@ class YouTubeChatBot:
                                     try:
                                         obs_trigger("revert_start")
                                         ok, err = retry_vbox(
-                                            lambda: subprocess.run([VBOXMANAGE_PATH,'controlvm',VM_NAME,'poweroff'], check=True),
+                                            lambda: _vbm_run(['controlvm',VM_NAME,'poweroff'], check=True),
                                             attempts=3, delay=3, source=f"Vote/revert-{'owner' if owner_bypass else 'chat'}/poweroff"
                                         )
                                         time.sleep(3)
                                         ok2, err2 = retry_vbox(
-                                            lambda: subprocess.run([VBOXMANAGE_PATH,'snapshot',VM_NAME,'restorecurrent'], check=True),
+                                            lambda: _vbm_run(['snapshot',VM_NAME,'restorecurrent'], check=True),
                                             attempts=3, delay=3, source=f"Vote/revert-{'owner' if owner_bypass else 'chat'}/snapshot"
                                         )
                                         time.sleep(3)
                                         ok3, err3 = retry_vbox(
-                                            lambda: subprocess.run([VBOXMANAGE_PATH,'startvm',VM_NAME], check=True),
+                                            lambda: _vbm_run(['startvm',VM_NAME], check=True),
                                             attempts=3, delay=4, source=f"Vote/revert-{'owner' if owner_bypass else 'chat'}/startvm"
                                         )
                                         if ok2 and ok3:
@@ -8069,7 +8234,7 @@ class NexovativeControlCenter:
             try:
                 speak_text("Restarting Virtual Machine...")
                 update_status("Restarting...")
-                subprocess.run([VBOXMANAGE_PATH, 'controlvm', VM_NAME, 'reset'], check=True)
+                _vbm_run(['controlvm', VM_NAME, 'reset'], check=True)
                 update_status("Running")
                 play_success_sound()
                 self.root.after(0, lambda: self._vm_set_last("Restarted ✔", self.GREEN))
@@ -8095,11 +8260,11 @@ class NexovativeControlCenter:
             try:
                 speak_text("Reverting Virtual Machine...")
                 update_status("Reverting...")
-                subprocess.run([VBOXMANAGE_PATH, 'controlvm', VM_NAME, 'poweroff'], check=True)
+                _vbm_run(['controlvm', VM_NAME, 'poweroff'], check=True)
                 time.sleep(3)
-                subprocess.run([VBOXMANAGE_PATH, 'snapshot', VM_NAME, 'restorecurrent'], check=True)
+                _vbm_run(['snapshot', VM_NAME, 'restorecurrent'], check=True)
                 time.sleep(3)
-                subprocess.run([VBOXMANAGE_PATH, 'startvm', VM_NAME], check=True)
+                _vbm_run(['startvm', VM_NAME], check=True)
                 update_status("Running")
                 play_success_sound()
                 vote_revert.clear()
@@ -8128,7 +8293,7 @@ class NexovativeControlCenter:
             try:
                 speak_text("Shutting down Virtual Machine...")
                 update_status("Shutting down...")
-                subprocess.run([VBOXMANAGE_PATH, 'controlvm', VM_NAME, 'poweroff'], check=True)
+                _vbm_run(['controlvm', VM_NAME, 'poweroff'], check=True)
                 update_status("Stopped")
                 self.root.after(0, lambda: self._vm_set_last("Powered off ✔", self.TEXTDIM))
             except Exception as e:
@@ -8387,7 +8552,7 @@ class NexovativeControlCenter:
                 speak_text("Restarting Virtual Machine...")
                 update_status("Restarting...")
                 try:
-                    subprocess.run([VBOXMANAGE_PATH, 'controlvm', VM_NAME, 'reset'], check=True)
+                    _vbm_run(['controlvm', VM_NAME, 'reset'], check=True)
                     update_status("Running")
                     play_success_sound()
                 except Exception as e:
@@ -8401,11 +8566,11 @@ class NexovativeControlCenter:
                 revert_in_progress = True
                 update_status("Reverting...")
                 try:
-                    subprocess.run([VBOXMANAGE_PATH, 'controlvm', VM_NAME, 'poweroff'], check=True)
+                    _vbm_run(['controlvm', VM_NAME, 'poweroff'], check=True)
                     time.sleep(3)
-                    subprocess.run([VBOXMANAGE_PATH, 'snapshot', VM_NAME, 'restorecurrent'], check=True)
+                    _vbm_run(['snapshot', VM_NAME, 'restorecurrent'], check=True)
                     time.sleep(3)
-                    subprocess.run([VBOXMANAGE_PATH, 'startvm', VM_NAME], check=True)
+                    _vbm_run(['startvm', VM_NAME], check=True)
                     update_status("Running")
                     play_success_sound()
                     vote_revert.clear()
