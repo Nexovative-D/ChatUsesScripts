@@ -1,7 +1,7 @@
 # VBox Script
 
 
-**Download VirtualBox and Download VirtualBox SDK for mouse commands: https://www.virtualbox.org/wiki/Downloads**
+**Download VirtualBox and VirtualBox SDK for mouse commands: https://www.virtualbox.org/wiki/Downloads**
 
 # VMware Script
 
