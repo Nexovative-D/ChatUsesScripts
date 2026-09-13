@@ -8,6 +8,32 @@ import sys
 import importlib.util as _importlib_util
 import json
 
+# ========================= WORKING DIRECTORY FIX =========================
+# When this script is launched by double-clicking the .py file in Explorer
+# (as opposed to running it from an already-open cmd/terminal window that's
+# cd'd into its folder), Windows does NOT guarantee the process starts with
+# its working directory set to the script's own folder — it depends on the
+# .py file association handler, and can end up somewhere the current user
+# doesn't have write access to (e.g. a Python install folder, System32, or
+# another protected location). Every overlay/status file this script writes
+# (newstatus.html, ban_vote.html, os_vote_status.html, votes.json, the
+# various *_config.json files, etc.) uses a bare relative filename, so it
+# gets written relative to whatever that working directory turns out to be
+# — which is exactly why double-clicking could produce "Access is denied"
+# on those writes while launching from cmd (already cd'd into the folder)
+# worked fine.
+#
+# Fixing this here, once, at the very top of the script — before any file
+# is opened for writing anywhere else — means every one of those relative
+# paths always resolves to the script's own folder regardless of how it
+# was launched, with no need to touch any of the individual write sites,
+# and no elevation/UAC involved (elevating breaks VirtualBox VM visibility
+# — see _is_admin's docstring below).
+try:
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+except Exception as e:
+    print(f"[Startup] Could not set working directory to script folder: {e}")
+
 # ========================= DPI / DISPLAY SCALE AWARENESS =========================
 # Must run before any window is created (including the UAC MessageBoxW below
 # and the first tk.Tk()), otherwise Windows treats this process as DPI-unaware
@@ -67,10 +93,10 @@ def _apply_tk_dpi_scaling(root):
 
 
 # Which backend the user wants YouTubeChatSource to use:
-#   "auto"            — try official (if key set) -> chat_downloader -> pytchat, in order (default)
-#   "official"        — official API only, no fallback
-#   "chat_downloader" — chat-downloader only, no fallback
-#   "pytchat"         — pytchat only, no fallback
+#   "auto"      — try innertube -> pytchat -> official (if key set), in order (default)
+#   "official"  — official API only, no fallback
+#   "innertube" — direct Innertube (YouTube internal API) only, no fallback
+#   "pytchat"   — pytchat only, no fallback
 # Asked once at startup via _ask_chat_backend_choice(), changeable any
 # time after that by re-running the picker or editing the config file.
 # Defined here (near the top) because _ask_chat_backend_choice() /
@@ -87,7 +113,7 @@ def load_chat_backend_preference():
             with open(CHAT_BACKEND_PREFERENCE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             pref = data.get("backend", "auto")
-            if pref in ("auto", "official", "chat_downloader", "pytchat"):
+            if pref in ("auto", "official", "innertube", "pytchat"):
                 CHAT_BACKEND_PREFERENCE = pref
     except Exception as e:
         print(f"[ChatBackendPref] Load error: {e}")
@@ -124,7 +150,7 @@ def _is_admin():
 
 
 # ========================= VERSION & UPDATE CHECK =========================
-VERSION = "31.5.0"   # increment this with every release
+VERSION = "31.6.0"   # increment this with every release
 
 # Raw URL of version.json in your repo, and the page to send users to
 # when a newer version is available.
@@ -369,7 +395,6 @@ def _ask_monitor_choice(monitors):
 _STARTUP_OPTIONAL_DEPS = [
     # (import_name, pip_package_name, human_label)
     ("pytchat",         "pytchat",                 "pytchat — reading YouTube live chat (backend 3 of 3)"),
-    ("chat_downloader", "chat-downloader",          "chat-downloader — reading YouTube live chat (backend 2 of 3)"),
     ("googleapiclient", "google-api-python-client", "google-api-python-client — official YouTube Data API chat backend (backend 1 of 3, needs an API key)"),
     ("win32com",     "pywin32",  "pywin32 — Windows COM / SAPI text-to-speech"),
     ("plyer",        "plyer",    "plyer — desktop toast notifications"),
@@ -430,6 +455,13 @@ def _show_vboxapi_only_notice():
         sw = dlg.winfo_screenwidth()
         sh = dlg.winfo_screenheight()
         mx, my = 0, 0
+    # Give the window a centered position right away (using an estimated
+    # height) so it never flashes at the OS default top-left position
+    # before the real size is known below — the same reason every other
+    # overrideredirect dialog in this script sets geometry immediately
+    # after creation instead of waiting until its content is built.
+    H_ESTIMATE = 220
+    dlg.geometry(f"{W}x{H_ESTIMATE}+{mx + (sw - W) // 2}+{my + (sh - H_ESTIMATE) // 2}")
     dlg.configure(bg="#0f0f1a")
 
     border = tk.Frame(dlg, bg="#7c5cbf", padx=2, pady=2)
@@ -757,20 +789,18 @@ def _show_chat_backend_dialog():
 
     options = [
         ("auto", "🔀  Auto (recommended)",
-         "Tries the official API first (if a key is set on the Main tab), "
-         "then chat-downloader, then pytchat — falls back automatically "
+         "Tries Innertube first, then pytchat, then the official API "
+         "(if a key is set on the Main tab) — falls back automatically "
          "if one fails."),
         ("official", "🔑  Official YouTube API only",
          "Needs an API key (set on the Main tab). Never breaks from a "
          "YouTube update, but uses your daily API quota. Fails with no "
          "fallback if the key is missing/invalid."),
-        ("chat_downloader", "📥  chat-downloader only",
-         "Free, no API key needed. Unofficial — reads YouTube's internal "
-         "chat format, so it can break if YouTube changes something.\n"
-         "⚠ Known issue: currently prone to failing with \"Unable to parse "
-         "initial video data\" — a bug in the chat-downloader library itself "
-         "(YouTube page format it depends on). If you hit that error, switch "
-         "to Auto or pytchat, or try 'pip install --upgrade chat-downloader'."),
+        ("innertube", "📥  Innertube only",
+         "Free, no API key needed. Talks directly to YouTube's internal "
+         "(undocumented) live-chat API — no third-party chat library "
+         "involved. Unofficial, so it can still break if YouTube changes "
+         "that internal format."),
         ("pytchat", "🐍  pytchat only",
          "Free, no API key needed. The original backend this script has "
          "always used. Also unofficial, same breakage risk as above."),
@@ -788,7 +818,7 @@ def _show_chat_backend_dialog():
                               font=("Segoe UI", 10, "bold"), anchor="w",
                               justify="left")
         title_lbl.pack(fill="x", padx=10, pady=(6, 0))
-        desc_fg = "#e0a72e" if value == "chat_downloader" else "#888888"
+        desc_fg = "#888888"
         desc_lbl = tk.Label(row, text=desc, bg="#1e1e2e", fg=desc_fg,
                              font=("Segoe UI", 8), anchor="w", justify="left",
                              wraplength=420)
@@ -1781,14 +1811,10 @@ except ImportError:
     _PYTCHAT_OK = False
     print("[Startup] pytchat not installed — YouTube chat reading will be disabled. Run: pip install pytchat")
 
-try:
-    from chat_downloader import ChatDownloader as _ChatDownloaderLib
-    _CHAT_DOWNLOADER_OK = True
-except ImportError:
-    _ChatDownloaderLib = None
-    _CHAT_DOWNLOADER_OK = False
-    print("[Startup] chat-downloader not installed — that chat backend will be unavailable. "
-          "Run: pip install chat-downloader")
+# Innertube backend needs no extra pip package — it talks to YouTube's
+# internal API directly over urllib.request (already imported below in
+# this module), so it's always available.
+_INNERTUBE_OK = True
 
 try:
     from googleapiclient.discovery import build as _google_api_build
@@ -1836,18 +1862,21 @@ class ChatMessage:
 
 class YouTubeChatSource:
     """
-    Reads YouTube live chat through up to three backends, tried in order
-    of reliability:
+    Reads YouTube live chat through up to three backends, tried in this
+    order under "auto":
 
-      1. Official YouTube Data API v3 — used only if an API key is
+      1. Innertube — unofficial, no API key needed. Talks directly to
+         YouTube's internal /youtubei/v1/live_chat/get_live_chat
+         endpoint over plain HTTP requests — no third-party chat library
+         involved.
+      2. pytchat — unofficial, no API key needed.
+      3. Official YouTube Data API v3 — used only if an API key is
          configured. This is the only backend Google actually guarantees
          to keep working, since it's a supported, documented API rather
          than a reverse-engineered read of YouTube's internal chat
          format. Costs YouTube API quota per poll.
-      2. chat-downloader — unofficial, no API key needed.
-      3. pytchat — unofficial, no API key needed.
 
-    Backends 2 and 3 both work by reverse-engineering YouTube's internal,
+    Backends 1 and 2 both work by reading YouTube's internal,
     undocumented chat data format, so either one can break instantly and
     completely if YouTube changes that format, with no guarantee of a
     fix from upstream. Having two of them side by side means one
@@ -1855,28 +1884,31 @@ class YouTubeChatSource:
     automatically falls through to the next available backend.
 
     Every reader in the script talks only to this class — never to
-    pytchat / chat_downloader / googleapiclient directly. If any backend
-    breaks or a better one comes along later, only this class needs to
-    change.
+    pytchat / googleapiclient / YouTube's Innertube endpoint directly.
+    If any backend breaks or a better one comes along later, only this
+    class needs to change.
     """
 
     def __init__(self, video_id: str, api_key: str = ""):
         self.video_id   = video_id
         self.api_key    = (api_key or "").strip()
-        self.backend_name = None   # "official" / "chat_downloader" / "pytchat" / None
+        self.backend_name = None   # "official" / "innertube" / "pytchat" / None
 
         # Official API state
         self._official_service         = None
         self._official_live_chat_id    = None
         self._official_next_page_token = None
 
-        # chat-downloader state — its iterator blocks waiting for each
-        # message, so it runs in its own thread feeding a queue that
+        # Innertube state — polling blocks waiting for each batch of
+        # messages, so it runs in its own thread feeding a queue that
         # get_messages() can drain without blocking the caller.
-        self._cd_chat       = None
-        self._cd_queue      = None
-        self._cd_thread     = None
-        self._cd_stop_event = None
+        self._it_queue          = None
+        self._it_thread         = None
+        self._it_stop_event     = None
+        self._it_continuation   = None
+        self._it_api_key        = None
+        self._it_client_version = None
+        self._it_seen_ids       = None
 
         # pytchat state
         self._pytchat_backend = None
@@ -1886,15 +1918,15 @@ class YouTubeChatSource:
     def connect(self) -> bool:
         """
         (Re)connects using whichever backend(s) CHAT_BACKEND_PREFERENCE
-        allows. "auto" (default) tries official -> chat_downloader ->
-        pytchat in order, falling through on failure. Any specific
-        choice ("official" / "chat_downloader" / "pytchat") tries ONLY
-        that backend — no silent fallback — since the whole point of
-        picking one explicitly is to control what's actually being used.
+        allows. "auto" (default) tries innertube -> pytchat -> official
+        in order, falling through on failure. Any specific choice
+        ("official" / "innertube" / "pytchat") tries ONLY that backend —
+        no silent fallback — since the whole point of picking one
+        explicitly is to control what's actually being used.
         """
         self.terminate()
         pref = CHAT_BACKEND_PREFERENCE if CHAT_BACKEND_PREFERENCE in (
-            "auto", "official", "chat_downloader", "pytchat") else "auto"
+            "auto", "official", "innertube", "pytchat") else "auto"
 
         if pref == "official":
             if self.api_key and self._connect_official():
@@ -1907,11 +1939,11 @@ class YouTubeChatSource:
             self.backend_name = None
             return False
 
-        if pref == "chat_downloader":
-            if self._connect_chat_downloader():
-                self.backend_name = "chat_downloader"
+        if pref == "innertube":
+            if self._connect_innertube():
+                self.backend_name = "innertube"
                 return True
-            print(f"[ChatSource] chat-downloader connect failed ({self.video_id}) — "
+            print(f"[ChatSource] Innertube connect failed ({self.video_id}) — "
                   "not falling back, per preference.")
             self.backend_name = None
             return False
@@ -1926,20 +1958,21 @@ class YouTubeChatSource:
             return False
 
         # pref == "auto" — try each in order, falling through on failure.
-        if self.api_key and self._connect_official():
-            self.backend_name = "official"
+        if self._connect_innertube():
+            self.backend_name = "innertube"
             return True
-        if self.api_key:
-            print("[ChatSource] Official API failed — falling back to chat-downloader.")
-
-        if self._connect_chat_downloader():
-            self.backend_name = "chat_downloader"
-            return True
-        print("[ChatSource] chat-downloader unavailable — falling back to pytchat.")
+        print("[ChatSource] Innertube unavailable — falling back to pytchat.")
 
         if self._connect_pytchat():
             self.backend_name = "pytchat"
             return True
+        print("[ChatSource] pytchat unavailable — falling back to official API.")
+
+        if self.api_key and self._connect_official():
+            self.backend_name = "official"
+            return True
+        if not self.api_key:
+            print("[ChatSource] No YouTube API key set — skipping official API.")
 
         print(f"[ChatSource] All backends failed to connect ({self.video_id}).")
         self.backend_name = None
@@ -1973,39 +2006,172 @@ class YouTubeChatSource:
             self._official_service = None
             return False
 
-    def _connect_chat_downloader(self) -> bool:
-        if not _CHAT_DOWNLOADER_OK:
-            print("[ChatSource] chat-downloader not installed — skipping.")
+    # Innertube is the same internal API youtube.com's own web player
+    # calls to fetch live chat. INNERTUBE_API_KEY below is a long-public,
+    # non-secret client key baked into every YouTube web page — it's
+    # not tied to any Google account or the official Data API quota.
+    _INNERTUBE_API_KEY       = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+    _INNERTUBE_CLIENT_NAME   = "WEB"
+    _INNERTUBE_CLIENT_VER    = "2.20240101.00.00"
+
+    def _connect_innertube(self) -> bool:
+        if not _INNERTUBE_OK:
+            print("[ChatSource] Innertube backend unavailable — skipping.")
             return False
         try:
-            url = f"https://www.youtube.com/watch?v={self.video_id}"
-            self._cd_chat       = _ChatDownloaderLib().get_chat(url)
-            self._cd_queue      = queue.Queue()
-            self._cd_stop_event = threading.Event()
-            self._cd_thread = threading.Thread(
-                target=self._cd_pump, daemon=True,
-                name=f"cd_pump_{self.video_id}")
-            self._cd_thread.start()
+            watch_url = f"https://www.youtube.com/watch?v={self.video_id}"
+            req = urllib.request.Request(
+                watch_url,
+                headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+
+            continuation = None
+            m = re.search(r'"continuation":"([^"]+)"', html)
+            if m:
+                continuation = m.group(1)
+            if not continuation:
+                print(f"[ChatSource] Innertube: could not find live chat "
+                      f"continuation for '{self.video_id}' — is it actually live?")
+                return False
+
+            api_key = self._INNERTUBE_API_KEY
+            m = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', html)
+            if m:
+                api_key = m.group(1)
+            client_ver = self._INNERTUBE_CLIENT_VER
+            m = re.search(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)"', html)
+            if m:
+                client_ver = m.group(1)
+
+            self._it_continuation   = continuation
+            self._it_api_key        = api_key
+            self._it_client_version = client_ver
+            self._it_seen_ids       = collections.deque(maxlen=2000)
+            self._it_queue          = queue.Queue()
+            self._it_stop_event     = threading.Event()
+            self._it_thread = threading.Thread(
+                target=self._it_pump, daemon=True,
+                name=f"it_pump_{self.video_id}")
+            self._it_thread.start()
             return True
         except Exception as e:
-            print(f"[ChatSource] chat-downloader connect failed: {e}")
-            self._cd_chat = None
+            print(f"[ChatSource] Innertube connect failed: {e}")
+            self._it_continuation = None
             return False
 
-    def _cd_pump(self):
-        """Background thread: chat-downloader's iterator blocks waiting for
-        each message to arrive, so it needs a dedicated thread feeding a
-        queue that get_messages() can drain without blocking the caller."""
+    def _it_fetch_once(self):
+        """One POST to the Innertube live_chat/get_live_chat endpoint.
+        Returns (list_of_raw_actions, next_continuation, poll_delay_ms)."""
+        url = ("https://www.youtube.com/youtubei/v1/live_chat/get_live_chat"
+               f"?key={self._it_api_key}")
+        body = json.dumps({
+            "context": {
+                "client": {
+                    "clientName": self._INNERTUBE_CLIENT_NAME,
+                    "clientVersion": self._it_client_version,
+                }
+            },
+            "continuation": self._it_continuation,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        cont_data = data.get("continuationContents", {}).get("liveChatContinuation", {})
+        actions = cont_data.get("actions", []) or []
+
+        next_cont = None
+        poll_ms = 2000
+        for c in cont_data.get("continuations", []) or []:
+            inner = (c.get("invalidationContinuationData")
+                     or c.get("timedContinuationData")
+                     or c.get("reloadContinuationData") or {})
+            if inner.get("continuation"):
+                next_cont = inner["continuation"]
+                poll_ms = inner.get("timeoutMs", poll_ms)
+                break
+
+        return actions, next_cont, poll_ms
+
+    @staticmethod
+    def _it_extract_text(text_run_container):
+        """Innertube message text arrives as a list of "runs" (plain text
+        runs and emoji runs) — this flattens them into one plain string."""
+        parts = []
+        for run in (text_run_container or {}).get("runs", []) or []:
+            if "text" in run:
+                parts.append(run["text"])
+            elif "emoji" in run:
+                shortcuts = run["emoji"].get("shortcuts") or []
+                parts.append(shortcuts[0] if shortcuts else "")
+        return "".join(parts)
+
+    def _it_pump(self):
+        """Background thread: polls the Innertube endpoint on the interval
+        YouTube itself suggests, feeding parsed messages into a queue that
+        get_messages() can drain without blocking the caller."""
+        first_batch = True   # the initial fetch replays existing chat
+                              # backlog, not new messages — discard it
+                              # (see below) so connect() only surfaces
+                              # messages sent from this point onward.
         try:
-            for item in self._cd_chat:
-                if self._cd_stop_event.is_set():
+            while not self._it_stop_event.is_set():
+                try:
+                    actions, next_cont, poll_ms = self._it_fetch_once()
+                except Exception as e:
+                    print(f"[ChatSource] Innertube poll error: {e}")
+                    if self._it_stop_event.wait(5):
+                        break
+                    continue
+
+                for action in actions:
+                    renderer = (
+                        action.get("addChatItemAction", {}).get("item", {})
+                              .get("liveChatTextMessageRenderer")
+                    )
+                    if not renderer:
+                        continue
+                    msg_id = renderer.get("id")
+                    if msg_id and msg_id in self._it_seen_ids:
+                        continue
+                    if msg_id:
+                        self._it_seen_ids.append(msg_id)
+
+                    if first_batch:
+                        # Backlog from before we connected — mark seen
+                        # (above) so it isn't reprocessed, but don't
+                        # queue it as a "new" message.
+                        continue
+
+                    author = renderer.get("authorName", {}).get("simpleText", "") or ""
+                    is_owner = any(
+                        badge.get("liveChatAuthorBadgeRenderer", {}).get("icon", {})
+                             .get("iconType") == "OWNER"
+                        for badge in renderer.get("authorBadges", []) or []
+                    )
+                    text = self._it_extract_text(renderer.get("message"))
+
+                    self._it_queue.put(ChatMessage(
+                        id=msg_id, author_name=author,
+                        is_owner=is_owner, text=text,
+                    ))
+
+                first_batch = False
+
+                if not next_cont:
+                    print("[ChatSource] Innertube: stream ended (no continuation).")
                     break
-                self._cd_queue.put(item)
-        except Exception as e:
-            if not self._cd_stop_event.is_set():
-                print(f"[ChatSource] chat-downloader stream ended: {e}")
+                self._it_continuation = next_cont
+
+                if self._it_stop_event.wait(min(max(poll_ms, 1000), 10000) / 1000):
+                    break
         finally:
-            self._cd_queue.put(None)   # signals end-of-stream to is_alive()/get_messages()
+            self._it_queue.put(None)   # signals end-of-stream to is_alive()/get_messages()
 
     def _connect_pytchat(self) -> bool:
         if not _PYTCHAT_OK:
@@ -2025,8 +2191,8 @@ class YouTubeChatSource:
         try:
             if self.backend_name == "official":
                 return self._official_service is not None
-            elif self.backend_name == "chat_downloader":
-                return bool(self._cd_thread and self._cd_thread.is_alive())
+            elif self.backend_name == "innertube":
+                return bool(self._it_thread and self._it_thread.is_alive())
             elif self.backend_name == "pytchat":
                 return bool(self._pytchat_backend and self._pytchat_backend.is_alive())
         except Exception:
@@ -2039,8 +2205,8 @@ class YouTubeChatSource:
         """Returns a list of ChatMessage for whatever arrived since the last call."""
         if self.backend_name == "official":
             return self._get_messages_official()
-        elif self.backend_name == "chat_downloader":
-            return self._get_messages_chat_downloader()
+        elif self.backend_name == "innertube":
+            return self._get_messages_innertube()
         elif self.backend_name == "pytchat":
             return self._get_messages_pytchat()
         return []
@@ -2075,37 +2241,20 @@ class YouTubeChatSource:
             ))
         return out
 
-    def _get_messages_chat_downloader(self):
+    def _get_messages_innertube(self):
+        # _it_pump() already parses each raw Innertube action into a
+        # ChatMessage before queuing it, so this just drains the queue.
         out = []
         while True:
             try:
-                item = self._cd_queue.get_nowait()
+                item = self._it_queue.get_nowait()
             except queue.Empty:
                 break
             if item is None:
-                # end-of-stream sentinel from _cd_pump — put it back so
-                # is_alive() logic (thread-based) still reflects reality,
-                # nothing further to read this round.
+                # end-of-stream sentinel from _it_pump — nothing further
+                # to read this round; is_alive() reflects the thread state.
                 break
-            try:
-                author = item.get("author", {}) or {}
-                # NOTE: chat-downloader doesn't expose a dedicated
-                # "is channel owner" boolean for YouTube — this infers it
-                # from the author's badge tooltips, which is the best
-                # signal available. Verify against a live stream if exact
-                # owner detection matters for your use case.
-                is_owner = any(
-                    "owner" in (b.get("title", "") or "").lower()
-                    for b in (author.get("badges", []) or [])
-                )
-                out.append(ChatMessage(
-                    id=item.get("message_id"),
-                    author_name=author.get("name", "") or "",
-                    is_owner=is_owner,
-                    text=item.get("message", "") or "",
-                ))
-            except Exception as e:
-                print(f"[ChatSource] Skipped malformed message: {e}")
+            out.append(item)
         return out
 
     def _get_messages_pytchat(self):
@@ -2132,14 +2281,17 @@ class YouTubeChatSource:
         self._official_live_chat_id    = None
         self._official_next_page_token = None
 
-        if self._cd_stop_event:
-            self._cd_stop_event.set()
-        if self._cd_thread and self._cd_thread.is_alive():
-            self._cd_thread.join(timeout=1)
-        self._cd_chat   = None
-        self._cd_queue  = None
-        self._cd_thread = None
-        self._cd_stop_event = None
+        if self._it_stop_event:
+            self._it_stop_event.set()
+        if self._it_thread and self._it_thread.is_alive():
+            self._it_thread.join(timeout=1)
+        self._it_queue          = None
+        self._it_thread         = None
+        self._it_stop_event     = None
+        self._it_continuation   = None
+        self._it_api_key        = None
+        self._it_client_version = None
+        self._it_seen_ids       = None
 
         if self._pytchat_backend:
             try:
@@ -3722,9 +3874,9 @@ def _realpc_bot_loop():
     if not _PYAUTOGUI_OK:
         _realpc_set_status("pyautogui not installed. Run: pip install pyautogui")
         return
-    if not (_PYTCHAT_OK or _CHAT_DOWNLOADER_OK or (_GOOGLE_API_OK and YOUTUBE_API_KEY)):
+    if not (_PYTCHAT_OK or _INNERTUBE_OK or (_GOOGLE_API_OK and YOUTUBE_API_KEY)):
         _realpc_set_status("No chat backend available. Run: pip install pytchat "
-                            "(or chat-downloader / google-api-python-client)")
+                            "(or google-api-python-client)")
         return
 
     wl_only   = REALPC_CONFIG.get("whitelist_only", False)
@@ -6769,9 +6921,37 @@ class NexovativeControlCenter:
     def _build_main_tab(self, parent):
         parent.configure(style="TFrame")
 
+        # ── Scrollable body ──
+        # Wrapped in a canvas + inner frame (same pattern used by the
+        # Real PC / OBS tabs) so that on small/short screens where the
+        # config card + buttons + chat/console pane don't all fit
+        # vertically, the tab can actually be scrolled down to reach
+        # the bottom instead of just clipping it with no way to see it.
+        canvas  = tk.Canvas(parent, bg=self.BG, highlightthickness=0)
+        vscroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg=self.BG)
+        _inner_win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_cfg(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        def _on_canvas_cfg(e):
+            canvas.itemconfig(_inner_win, width=e.width)
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+        inner.bind("<Configure>",  _on_inner_cfg)
+        canvas.bind("<Configure>", _on_canvas_cfg)
+        canvas.bind("<MouseWheel>", _on_wheel)
+        inner.bind("<MouseWheel>",  _on_wheel)
+        self._main_tab_scroll_wheel = _on_wheel   # bound onto child widgets below too
+
         # Config card
-        card = ttk.Frame(parent, style="Card.TFrame", padding=16)
+        card = ttk.Frame(inner, style="Card.TFrame", padding=16)
         card.pack(fill="x", padx=12, pady=(12,6))
+        card.bind("<MouseWheel>", _on_wheel)
 
         # YouTube ID
         tk.Label(card, text="YouTube Video ID", bg=self.BG2,
@@ -6857,17 +7037,22 @@ class NexovativeControlCenter:
         yt_key_show_btn = ttk.Button(api_key_row, text="👁 Show", style="Dim.TButton",
                                       command=_toggle_yt_api_key_visibility)
         yt_key_show_btn.pack(side="left", padx=(6,0))
-        ttk.Button(api_key_row, text="💾 Save Key", style="Green.TButton",
-                   command=self._save_youtube_api_key).pack(side="left", padx=(6,0))
-        tk.Label(card,
+        yt_key_save_btn = ttk.Button(api_key_row, text="💾 Save Key", style="Green.TButton",
+                   command=self._save_youtube_api_key)
+        yt_key_save_btn.pack(side="left", padx=(6,0))
+        self._yt_api_key_show_btn = yt_key_show_btn
+        self._yt_api_key_save_btn = yt_key_save_btn
+        self._yt_api_key_note_lbl = tk.Label(card,
                  text="Optional. Enables the official YouTube Data API v3 chat backend — "
                       "the only one Google guarantees won't break, but it uses your API "
                       "quota. Leave blank to keep using the free (unofficial) backends. "
                       "Saved locally, entered once.",
                  bg=self.BG2, fg=self.TEXTDIM, font=("Segoe UI", 8),
-                 justify="left").grid(row=7, column=1, columnspan=2, sticky="w", pady=(2,4))
+                 justify="left")
+        self._yt_api_key_note_lbl.grid(row=7, column=1, columnspan=2, sticky="w", pady=(2,4))
+        self._update_youtube_api_key_field_state()
 
-        # Chat backend picker (auto / official / chat-downloader / pytchat)
+        # Chat backend picker (auto / official / innertube / pytchat)
         tk.Label(card, text="Chat Backend", bg=self.BG2,
                  fg=self.TEXTDIM, font=("Segoe UI",9,"bold")).grid(
                  row=8, column=0, sticky="w", padx=(0,8), pady=(10,0))
@@ -6883,8 +7068,9 @@ class NexovativeControlCenter:
         card.columnconfigure(1, weight=1)
 
         # Start / Stop buttons
-        btn_frame = tk.Frame(parent, bg=self.BG)
+        btn_frame = tk.Frame(inner, bg=self.BG)
         btn_frame.pack(fill="x", padx=12, pady=6)
+        btn_frame.bind("<MouseWheel>", _on_wheel)
         ttk.Button(btn_frame, text="▶  Start Bot", style="Green.TButton",
                    command=self._start_bot).pack(side="left", padx=(0,8))
         ttk.Button(btn_frame, text="⏹  Stop Bot", style="Red.TButton",
@@ -6893,8 +7079,9 @@ class NexovativeControlCenter:
                    command=self._minimize_to_tray).pack(side="left", padx=(8, 0))
 
         # Test Mode
-        test_frame = tk.Frame(parent, bg=self.BG2, padx=12, pady=8)
+        test_frame = tk.Frame(inner, bg=self.BG2, padx=12, pady=8)
         test_frame.pack(fill="x", padx=12, pady=(0, 4))
+        test_frame.bind("<MouseWheel>", _on_wheel)
         self._test_mode_var = tk.BooleanVar(value=False)
         self._test_mode_btn = tk.Checkbutton(
             test_frame,
@@ -6917,11 +7104,10 @@ class NexovativeControlCenter:
         )
         self._test_mode_note.pack(anchor="w", pady=(2, 0))
 
-        # Admin command bar packed with side='bottom' BEFORE the console,
-        # so it stays visible. If packed after a widget with expand=True,
-        # the console would consume all space and push the bar off-screen.
-        admin_frame = tk.Frame(parent, bg=self.BG2, pady=6)
-        admin_frame.pack(fill="x", padx=12, pady=(0,4), side="bottom")
+        # Admin command bar
+        admin_frame = tk.Frame(inner, bg=self.BG2, pady=6)
+        admin_frame.pack(fill="x", padx=12, pady=(0,4))
+        admin_frame.bind("<MouseWheel>", _on_wheel)
         tk.Label(admin_frame, text="Admin CMD:",
                  bg=self.BG2, fg=self.TEXTDIM,
                  font=("Segoe UI",9,"bold")).pack(side="left", padx=(8,6))
@@ -6934,10 +7120,17 @@ class NexovativeControlCenter:
                    command=self._send_admin_cmd).pack(side="left")
 
         # ── Bottom pane: Live Chat Viewer | Console Output ──
-        bottom_pane = tk.PanedWindow(parent, orient="horizontal",
+        # Given a fixed height (instead of expand=True) since this sits
+        # inside a scrollable canvas now — "expand" has no natural bound
+        # there, so a fixed height keeps this section a normal, readable
+        # size while remaining reachable by scrolling the tab on short
+        # screens, rather than being invisibly stretched or clipped.
+        bottom_pane = tk.PanedWindow(inner, orient="horizontal",
                                      bg=self.BORDER, sashwidth=5,
-                                     sashrelief="flat", bd=0)
-        bottom_pane.pack(fill="both", expand=True, padx=12, pady=(2, 0))
+                                     sashrelief="flat", bd=0,
+                                     height=320)
+        bottom_pane.pack(fill="both", expand=False, padx=12, pady=(2, 10))
+        bottom_pane.pack_propagate(False)
 
         # Left: Live Chat Viewer
         chat_outer = tk.Frame(bottom_pane, bg=self.BG)
@@ -8241,6 +8434,23 @@ class NexovativeControlCenter:
     def _change_chat_backend(self):
         _show_chat_backend_dialog()   # blocks until the user picks something
         self._chat_backend_status_lbl.configure(text=f"Currently: {CHAT_BACKEND_PREFERENCE}")
+        self._update_youtube_api_key_field_state()
+
+    def _update_youtube_api_key_field_state(self):
+        """
+        The API key field is only useful when the "official" backend is
+        actually selected — for "auto"/"innertube"/"pytchat" it does
+        nothing, so keep it disabled to avoid implying otherwise. Re-run
+        after the backend picker closes so choosing "official" there
+        turns the field back on immediately.
+        """
+        is_official = (CHAT_BACKEND_PREFERENCE == "official")
+        state = "normal" if is_official else "disabled"
+        self._yt_api_key_entry.configure(state=state)
+        self._yt_api_key_show_btn.configure(state=state)
+        self._yt_api_key_save_btn.configure(state=state)
+        self._yt_api_key_note_lbl.configure(
+            fg=self.TEXTDIM if is_official else self.BG3)
 
     def _save_youtube_api_key(self):
         global YOUTUBE_API_KEY
