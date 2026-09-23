@@ -29,7 +29,6 @@ analysis tools at the code-behavior level.** Both:
 - inject synthetic keyboard/mouse input into a system,
 - can be triggered/controlled by input arriving from outside the machine
   (in this case, YouTube chat — in malware's case, a C2 server),
-- check for admin privileges (`IsUserAnAdmin`),
 - gather basic system/process info (`psutil`) to decide what to do,
 - may register themselves to auto-start (so the bot survives a reboot
   during a long stream),
