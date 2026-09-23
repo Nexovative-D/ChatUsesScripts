@@ -7,6 +7,7 @@ import os
 import sys
 import importlib.util as _importlib_util
 import json
+import math
 
 # ========================= WORKING DIRECTORY FIX =========================
 # When this script is launched by double-clicking the .py file in Explorer
@@ -33,6 +34,79 @@ try:
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 except Exception as e:
     print(f"[Startup] Could not set working directory to script folder: {e}")
+
+# ========================= DATA FOLDERS (v32.0) =========================
+# All the *_config.json / event log / votes-style files this app writes
+# used to sit as bare filenames directly next to the script — over a
+# year of updates that grew into 20+ loose .json files cluttering the
+# folder. As of v32.0 they're grouped into two subfolders instead:
+#   NexoScriptFiles/       -> every JSON config/data file
+#   NexoScriptHTMLFiles/   -> every HTML stream overlay file
+# (overlays are kept in their own folder, separate from JSON, since their
+# paths are also typed into OBS as Browser Source URLs — keeping them
+# together but distinct from JSON makes it obvious which folder to point
+# OBS at). Created once here, right after the working-directory fix above
+# and before anything else in the file opens a config for reading/writing.
+NEXO_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "NexoScriptFiles")
+NEXO_HTML_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "NexoScriptHTMLFiles")
+
+for _nexo_dir in (NEXO_DATA_DIR, NEXO_HTML_DIR):
+    try:
+        os.makedirs(_nexo_dir, exist_ok=True)
+    except Exception as e:
+        print(f"[Startup] Could not create '{_nexo_dir}': {e}")
+
+
+def _nexo_data_path(filename):
+    """Resolves a bare JSON/data filename to its home in NexoScriptFiles/."""
+    return os.path.join(NEXO_DATA_DIR, filename)
+
+
+def _nexo_html_path(filename):
+    """Resolves a bare overlay filename to its home in NexoScriptHTMLFiles/."""
+    return os.path.join(NEXO_HTML_DIR, filename)
+
+
+def _nexo_migrate_legacy_files():
+    """
+    One-time upgrade step for people updating from pre-32.0 versions:
+    if any of the old loose files still sit next to the script (from
+    before this folder split existed), move them into their new home
+    instead of leaving the script to silently start over with fresh
+    defaults. Safe to run every launch — it's a no-op once migrated.
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    json_names = [
+        "chat_backend_preference.json", "startup_prefs.json", "custom_commands.json",
+        "votes.json", "youtube_api_key_config.json", "realpc_config.json",
+        "realpc_unblocked_patterns.json", "event_log.json", "permissions_config.json",
+        "sound_config.json", "nexoai_config.json", "multi_stream_config.json",
+        "scheduler_config.json", "user_mgmt.json", "auto_start_config.json",
+        "appearance_config.json", "obs_config.json", "vm_danger_filter_config.json",
+        "reconnect_config.json", "os_voting_config.json", "chaos_config.json",
+    ]
+    html_names = ["newstatus.html", "ban_vote.html", "os_vote_status.html", "chaos_status.html"]
+    for name in json_names:
+        old_path = os.path.join(base, name)
+        new_path = _nexo_data_path(name)
+        if os.path.exists(old_path) and not os.path.exists(new_path):
+            try:
+                os.replace(old_path, new_path)
+                print(f"[Migrate] Moved {name} -> NexoScriptFiles/")
+            except Exception as e:
+                print(f"[Migrate] Could not move {name}: {e}")
+    for name in html_names:
+        old_path = os.path.join(base, name)
+        new_path = _nexo_html_path(name)
+        if os.path.exists(old_path) and not os.path.exists(new_path):
+            try:
+                os.replace(old_path, new_path)
+                print(f"[Migrate] Moved {name} -> NexoScriptHTMLFiles/")
+            except Exception as e:
+                print(f"[Migrate] Could not move {name}: {e}")
+
+
+_nexo_migrate_legacy_files()
 
 # ========================= DPI / DISPLAY SCALE AWARENESS =========================
 # Must run before any window is created (including the UAC MessageBoxW below
@@ -103,7 +177,7 @@ def _apply_tk_dpi_scaling(root):
 # _show_chat_backend_dialog() are called during splash startup, before
 # the rest of the module body has executed.
 CHAT_BACKEND_PREFERENCE      = "auto"
-CHAT_BACKEND_PREFERENCE_FILE = "chat_backend_preference.json"
+CHAT_BACKEND_PREFERENCE_FILE = _nexo_data_path("chat_backend_preference.json")
 
 
 def load_chat_backend_preference():
@@ -150,7 +224,7 @@ def _is_admin():
 
 
 # ========================= VERSION & UPDATE CHECK =========================
-VERSION = "31.6.0"   # increment this with every release
+VERSION = "32.0.0"   # increment this with every release
 
 # Raw URL of version.json in your repo, and the page to send users to
 # when a newer version is available.
@@ -239,12 +313,23 @@ _splash_by_label = None
 _splash_bar_bg = None
 _splash_spinner_canvas = None   # Canvas holding the rotating dot spinner
 _splash_spinner_angle  = 0      # current rotation angle of the spinner, in degrees
+_splash_anim_start     = 0.0    # time.time() when the splash spinner started
+SPLASH_BG                  = "#000000"
+SPLASH_SPIN_MIN_SECONDS    = 0.12
+USE_SEPARATE_SPLASH        = True
+_splash_proc               = None
+SPLASH_WINDOW_W            = 480
+SPLASH_WINDOW_H            = 260
+SPLASH_SPINNER_SIZE        = 80
+SPLASH_SPINNER_DOTS        = 5
+SPLASH_SPINNER_LAP_SECONDS = 2.4
+SPLASH_SPINNER_STAGGER     = 0.14
 _host_root     = None   # the one-and-only tk.Tk() instance (kept hidden during splash)
 APP_LITE_MODE  = False  # True = Lite Mode (fewer widgets, slower polling, for weaker PCs)
 APP_EXTENDED_INTRO = False   # True = play the ~8s full-screen intro animation instead of the short one
 SELECTED_MONITOR = None   # dict {"left","top","width","height"} of the monitor the user picked, or None if only one monitor exists
 
-STARTUP_PREFS_FILE = "startup_prefs.json"
+STARTUP_PREFS_FILE = _nexo_data_path("startup_prefs.json")
 
 
 def _load_startup_prefs():
@@ -1016,32 +1101,207 @@ def _ask_startup_mode():
           f"extended intro: {APP_EXTENDED_INTRO}")
 
 
+_SPLASH_PROC_SOURCE = r'''import sys
+import math
+import time
+import tkinter as tk
+
+BG = "#000000"
+BORDER = "#d8d8d8"
+BORDER_W = 2
+W, H = 480, 260
+
+DOTS = 5
+LAP = 3.2
+STAGGER = 0.14
+RADIUS = 14
+DOT_R = 2.6
+# The sweep MUST be a whole number of turns. With 540 deg (1.5 turns) a dot
+# always vanished half a turn away from where it was born, so it disappeared
+# at the bottom and reappeared at the top. 720 deg (2 turns) makes birth and
+# vanish the same point, and START_DEG = +90 puts that point at the BOTTOM.
+# LAP is 3.2 so the angular speed is unchanged (720 / 3.2 == 540 / 2.4).
+SWEEP = 720.0
+CANVAS = 40
+START_DEG = 90.0
+
+
+def ease(t):
+    return t + 0.5 * math.sin(2 * math.pi * t + math.pi) / (2 * math.pi) * -1
+
+
+def main():
+    left = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    top = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    sw = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+    sh = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+
+    root = tk.Tk()
+    root.overrideredirect(True)
+    root.configure(bg=BORDER)
+    if not sw or not sh:
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    x = left + (sw - W) // 2
+    y = top + (sh - H) // 2
+    root.geometry(f"{W}x{H}+{x}+{y}")
+    root.attributes("-topmost", True)
+
+    inner = tk.Frame(root, bg=BG)
+    inner.place(x=BORDER_W, y=BORDER_W, width=W - 2 * BORDER_W, height=H - 2 * BORDER_W)
+
+    tk.Label(inner, text="NEXOVATIVE", bg=BG, fg="#ffffff",
+             font=("Segoe UI Light", 30)).place(relx=0.5, rely=0.38, anchor="center")
+
+    canvas = tk.Canvas(inner, width=CANVAS, height=CANVAS, bg=BG,
+                       highlightthickness=0, bd=0)
+    canvas.place(relx=0.5, rely=0.72, anchor="center")
+
+    t0 = time.time()
+    period = LAP + DOTS * STAGGER
+    cx = cy = CANVAS / 2
+
+    def frame():
+        canvas.delete("d")
+        now = time.time() - t0
+        for i in range(DOTS):
+            local = ((now - i * STAGGER) % period) / LAP
+            if local > 1.0:
+                continue
+            a = math.radians(ease(local) * SWEEP + START_DEG)
+            px = cx + RADIUS * math.cos(a)
+            py = cy + RADIUS * math.sin(a)
+            canvas.create_oval(px - DOT_R, py - DOT_R, px + DOT_R, py + DOT_R,
+                               fill="#ffffff", outline="", tags="d")
+        root.after(8, frame)
+
+    def keep_front():
+        try:
+            root.lift()
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        root.after(300, keep_front)
+
+    def watch_stdin():
+        try:
+            line = sys.stdin.readline()
+        except Exception:
+            line = ""
+        return line
+
+    import threading
+    def reader():
+        while True:
+            line = watch_stdin()
+            if not line or line.strip() == "quit":
+                root.after(0, root.destroy)
+                return
+    threading.Thread(target=reader, daemon=True).start()
+
+    root.bind("<Button-1>", lambda e: "break")
+    frame()
+    keep_front()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _start_splash_process():
+    global _splash_proc
+    if not USE_SEPARATE_SPLASH or _splash_proc is not None:
+        return
+    try:
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), "nexovative_splash.py")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(_SPLASH_PROC_SOURCE)
+
+        if SELECTED_MONITOR:
+            args = [str(SELECTED_MONITOR["left"]), str(SELECTED_MONITOR["top"]),
+                    str(SELECTED_MONITOR["width"]), str(SELECTED_MONITOR["height"])]
+        else:
+            args = ["0", "0",
+                    str(_host_root.winfo_screenwidth()),
+                    str(_host_root.winfo_screenheight())]
+
+        exe = sys.executable
+        if os.path.basename(exe).lower() == "python.exe":
+            candidate = os.path.join(os.path.dirname(exe), "pythonw.exe")
+            if os.path.exists(candidate):
+                exe = candidate
+
+        flags = 0
+        if sys.platform == "win32":
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+        _splash_proc = subprocess.Popen(
+            [exe, path] + args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+        time.sleep(0.15)
+        if _splash_proc.poll() is not None:
+            _splash_proc = None
+    except Exception as e:
+        print(f"[Splash] Separate splash process failed, using built-in splash: {e}")
+        _splash_proc = None
+
+
+def _stop_splash_process():
+    global _splash_proc
+    proc = _splash_proc
+    _splash_proc = None
+    if proc is None:
+        return
+    try:
+        proc.stdin.write(b"quit\n")
+        proc.stdin.flush()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=1.5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+import atexit as _atexit
+_atexit.register(lambda: _stop_splash_process())
+
+
 def _create_splash():
     global _splash_root, _splash_bar, _splash_label, _splash_pct, _host_root
     global _splash_inner, _splash_brand_label, _splash_title_label, _splash_by_label, _splash_bar_bg
-    global _splash_spinner_canvas, _splash_spinner_angle
+    global _splash_spinner_canvas, _splash_spinner_angle, _splash_anim_start
 
-    # Create the single tk.Tk() host window and keep it hidden.
-    # All ttk styles will be registered on this interpreter.
     _host_root = tk.Tk()
     _host_root.withdraw()
-    _apply_tk_dpi_scaling(_host_root)   # match Tk's own scaling to the real Windows display scale
+    _apply_tk_dpi_scaling(_host_root)
 
     monitors = _detect_monitors()
-    _ask_monitor_choice(monitors)   # only actually prompts if more than one monitor was found
+    _ask_monitor_choice(monitors)
 
-    _run_dependency_check_and_offer_install()   # offers to pip-install any missing optional packages; restarts the script if the user accepts
+    _run_dependency_check_and_offer_install()
 
-    _ask_chat_backend_choice()   # user picks which YouTube chat backend to use (official API / chat-downloader / pytchat / auto)
+    _ask_chat_backend_choice()
 
-    _ask_startup_mode()   # user picks Full GUI vs Lite Mode before anything else loads
+    _ask_startup_mode()
 
-    W, H = 480, 240
-    # Splash is a Toplevel so it shares the same Tk interpreter
+    _start_splash_process()
+    if _splash_proc is not None:
+        return
+
     splash = tk.Toplevel(_host_root)
     splash.title("")
     splash.resizable(False, False)
-    splash.overrideredirect(True)          # borderless window
+    splash.overrideredirect(True)
     if SELECTED_MONITOR:
         sw, sh = SELECTED_MONITOR["width"], SELECTED_MONITOR["height"]
         mx, my = SELECTED_MONITOR["left"], SELECTED_MONITOR["top"]
@@ -1049,142 +1309,96 @@ def _create_splash():
         sw = splash.winfo_screenwidth()
         sh = splash.winfo_screenheight()
         mx, my = 0, 0
-    x  = mx + (sw - W) // 2
-    y  = my + (sh - H) // 2
+    W, H = SPLASH_WINDOW_W, SPLASH_WINDOW_H
+    x = mx + (sw - W) // 2
+    y = my + (sh - H) // 2
     splash.geometry(f"{W}x{H}+{x}+{y}")
-    splash.configure(bg="#0f0f1a")
+    splash.configure(bg=SPLASH_BG)
 
-    # Border frame
-    border = tk.Frame(splash, bg="#7c5cbf", padx=2, pady=2)
-    border.place(relx=0, rely=0, relwidth=1, relheight=1)
-    inner = tk.Frame(border, bg="#0f0f1a")
-    inner.pack(fill="both", expand=True)
+    inner = tk.Frame(splash, bg=SPLASH_BG)
+    inner.place(relx=0, rely=0, relwidth=1, relheight=1)
     _splash_inner = inner
 
-    # "Script by Nexovative"
-    _splash_by_label = tk.Label(inner, text="Script by Nexovative",
-             bg="#0f0f1a", fg="#f0c060",
-             font=("Segoe UI", 11, "bold"))
-    _splash_by_label.pack(pady=(18, 0))
+    _splash_title_label = tk.Label(inner, text="NEXOVATIVE",
+                                    bg=SPLASH_BG, fg="#ffffff",
+                                    font=("Segoe UI Light", 30))
+    _splash_title_label.place(relx=0.5, rely=0.36, anchor="center")
 
-    # App title
-    _splash_title_label = tk.Label(inner, text="Nexovative Control Center",
-             bg="#0f0f1a", fg="#ffffff",
-             font=("Segoe UI", 18, "bold"))
-    _splash_title_label.pack(pady=(4, 0))
-
-    # ── Windows 11-style rotating dot spinner ──
-    SPINNER_SIZE = 46
-    spinner = tk.Canvas(inner, width=SPINNER_SIZE, height=SPINNER_SIZE,
-                         bg="#0f0f1a", highlightthickness=0, bd=0)
-    spinner.pack(pady=(16, 10))
+    spinner = tk.Canvas(inner, width=SPLASH_SPINNER_SIZE, height=SPLASH_SPINNER_SIZE,
+                         bg=SPLASH_BG, highlightthickness=0, bd=0)
+    spinner.place(relx=0.5, rely=0.72, anchor="center")
     _splash_spinner_canvas = spinner
     _splash_spinner_angle = 0
+    _splash_anim_start = time.time()
     _draw_spinner(0)
 
-    # Status row: current library being imported, with percentage alongside
-    status_row = tk.Frame(inner, bg="#0f0f1a")
-    status_row.pack(pady=(0, 8))
+    _splash_label = tk.Label(inner, text="", bg=SPLASH_BG, fg=SPLASH_BG,
+                              font=("Segoe UI", 1))
+    _splash_pct = tk.Label(inner, text="", bg=SPLASH_BG, fg=SPLASH_BG,
+                            font=("Segoe UI", 1))
 
-    _splash_label = tk.Label(status_row, text="Starting up...",
-                              bg="#0f0f1a", fg="#cccccc",
-                              font=("Segoe UI", 9))
-    _splash_label.pack(side="left")
-
-    _splash_pct = tk.Label(status_row, text="0%",
-                            bg="#0f0f1a", fg="#3ddc97",
-                            font=("Segoe UI", 9, "bold"))
-    _splash_pct.pack(side="left", padx=(8, 0))
-
-    # Kept for compatibility with code that references these — unused now
-    # that the loading bar has been replaced by the spinner above.
+    _splash_by_label = None
     _splash_bar_bg = None
     _splash_bar    = None
 
-    # Hidden until loading finishes — shows the animated "NEXOVATIVE" reveal.
     _splash_brand_label = tk.Label(inner, text="",
-                                    bg="#0f0f1a", fg="#7c5cbf",
+                                    bg=SPLASH_BG, fg="#a684e8",
                                     font=("Segoe UI", 22, "bold"))
-    # not packed yet — packed only when the intro animation starts
 
     _splash_root = splash
     splash.lift()
-    # splash.attributes("-topmost", True)  # removed: caused splash to stay always on top
     splash.update()
 
 
-def _draw_spinner(angle):
-    """
-    Draws a Windows 11-style rotating dot ring on the spinner canvas at the
-    given rotation angle (degrees). Dots fade from bright to dim going
-    backwards around the ring, giving the same "chasing dots" look as the
-    Windows 11 boot/loading spinner.
-    """
-    import math
+def _spinner_ease(t):
+    return t + 0.5 * math.sin(2 * math.pi * t + math.pi) / (2 * math.pi) * -1
 
+
+def _draw_spinner(angle=0):
     canvas = _splash_spinner_canvas
     if canvas is None:
         return
     canvas.delete("spinner")
 
-    size = 46
+    now = time.time() - _splash_anim_start
+    size = SPLASH_SPINNER_SIZE
     cx, cy = size / 2, size / 2
-    radius = size / 2 - 5
-    dot_count = 8
-    base_color = (166, 132, 232)   # #a684e8, matches ACCENT2
+    radius = size / 2 - 8
+    lap = SPLASH_SPINNER_LAP_SECONDS
+    period = lap + SPLASH_SPINNER_DOTS * SPLASH_SPINNER_STAGGER
 
-    for i in range(dot_count):
-        dot_angle = math.radians(angle + i * (360 / dot_count))
-        dx = cx + radius * math.cos(dot_angle)
-        dy = cy + radius * math.sin(dot_angle)
-
-        # Brightness fades around the ring so the ring reads as "spinning".
-        brightness = 1.0 - (i / dot_count) * 0.85
-        r = int(15 + (base_color[0] - 15) * brightness)
-        g = int(15 + (base_color[1] - 15) * brightness)
-        b = int(26 + (base_color[2] - 26) * brightness)
-        color = f"#{r:02x}{g:02x}{b:02x}"
-
-        dot_radius = 2.6 + 1.6 * brightness
-        canvas.create_oval(dx - dot_radius, dy - dot_radius,
-                            dx + dot_radius, dy + dot_radius,
-                            fill=color, outline="", tags="spinner")
+    for i in range(SPLASH_SPINNER_DOTS):
+        local = ((now - i * SPLASH_SPINNER_STAGGER) % period) / lap
+        if local > 1.0:
+            continue
+        # Start/end at the BOTTOM (+90 deg) so a dot is reborn where it vanished.
+        deg = _spinner_ease(local) * 360.0 + 90.0
+        rad = math.radians(deg)
+        x = cx + radius * math.cos(rad)
+        y = cy + radius * math.sin(rad)
+        r = 3.4
+        canvas.create_oval(x - r, y - r, x + r, y + r,
+                            fill="#ffffff", outline="", tags="spinner")
 
 
 def _spin_splash(steps=10, step_degrees=12, delay=0.012):
-    """
-    Advances the spinner animation by a few frames. Called from
-    _update_splash so the spinner keeps moving every time loading
-    progress is reported, without needing a separate background thread.
-    """
-    global _splash_spinner_angle
     if _splash_root is None or _splash_spinner_canvas is None:
         return
     try:
-        for _ in range(steps):
-            _splash_spinner_angle = (_splash_spinner_angle + step_degrees) % 360
-            _draw_spinner(_splash_spinner_angle)
+        end = time.time() + SPLASH_SPIN_MIN_SECONDS
+        while time.time() < end:
+            _draw_spinner()
             _splash_root.update_idletasks()
             _splash_root.update()
-            time.sleep(delay)
+            time.sleep(0.008)
     except Exception:
         pass
 
 
 def _update_splash(pct, label=None):
-    """
-    Update the spinner-based loading screen (call from main thread).
-    `label` is shown as the current step / library being imported, and
-    `pct` is shown alongside it as a percentage. Also spins the dot
-    ring forward a few frames so it animates continuously as loading
-    progresses.
-    """
-    if _splash_root is None:
+    if _splash_proc is not None or _splash_root is None:
         return
     try:
-        _splash_pct.configure(text=f"{pct}%")
-        if label:
-            _splash_label.configure(text=label)
         _spin_splash()
     except Exception:
         pass
@@ -1277,21 +1491,19 @@ def _play_splash_outro_animation():
                   _splash_spinner_canvas):
             if w is not None:
                 w.pack_forget()
-        # The spinner's percentage/status labels live inside a small
-        # container frame (status_row) that isn't tracked by any global —
-        # walk the splash tree and hide any leftover children so nothing
-        # from the loading screen lingers on top of the reveal.
+                w.place_forget()
         for child in _splash_inner.winfo_children():
             if child not in (_splash_brand_label,):
                 child.pack_forget()
+                child.place_forget()
 
-        BG = "#0f0f1a"
+        BG = SPLASH_BG
         word = "NEXOVATIVE"
 
         canvas_w, canvas_h = 440, 130
         canvas = tk.Canvas(_splash_inner, width=canvas_w, height=canvas_h,
                             bg=BG, highlightthickness=0, bd=0)
-        canvas.pack(pady=(24, 0))
+        canvas.place(relx=0.5, rely=0.5, anchor="center")
         _splash_root.update_idletasks()
         _splash_root.update()
         time.sleep(0.12)   # tiny beat so the cleared layout is visible first
@@ -1496,7 +1708,7 @@ def _play_extended_intro_animation():
 
         print("[Intro] playing extended ~8s intro animation...")
 
-        BG = "#0a0a14"
+        BG = SPLASH_BG
         win = tk.Toplevel(_host_root)
         win.overrideredirect(True)
         win.configure(bg=BG)
@@ -1776,6 +1988,7 @@ def _play_extended_intro_animation():
 
 def _close_splash():
     global _splash_root
+    _stop_splash_process()
     if _splash_root:
         try:
             _splash_root.destroy()   # destroy only the Toplevel splash
@@ -2372,7 +2585,7 @@ _update_splash(80, "Initializing VirtualBox manager...")
 
 
 # ========================= CUSTOM COMMANDS =========================
-CUSTOM_COMMANDS_FILE = "custom_commands.json"
+CUSTOM_COMMANDS_FILE = _nexo_data_path("custom_commands.json")
 custom_commands = {}  # {"!bubbles": [{"action": "combo", "args": "win+r"}, ...]}
 
 # ========================= NOTIFICATIONS & TRAY =========================
@@ -2652,12 +2865,65 @@ def _cooldown_overlay_ticker():
       #      print(f"[Stats] Fetch error: {e}")
       #  time.sleep(30)
 
+OVERLAY_ALLOWED_FILES = {
+    "chat.html",
+    _nexo_html_path("newstatus.html"),
+    _nexo_html_path("ban_vote.html"),
+    _nexo_html_path("os_vote_status.html"),
+    "overlay.json",
+    _nexo_data_path("votes.json"),
+    "success.mp3",
+}
+
+OVERLAY_ALLOWED_EXTENSIONS = {
+    ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
+    ".mp3", ".wav", ".ogg", ".webm", ".mp4", ".woff", ".woff2", ".ttf",
+}
+
+
 def start_overlay_server():
     PORT = 8083
-    class QuietHandler(http.server.SimpleHTTPRequestHandler):
-        def log_message(self, format, *args): pass
+
+    class OverlayHandler(http.server.SimpleHTTPRequestHandler):
+        def _is_allowed(self):
+            from urllib.parse import urlsplit, unquote
+            path = unquote(urlsplit(self.path).path)
+            if "\x00" in path or "\\" in path or ".." in path.split("/"):
+                return False
+            name = path.lstrip("/")
+            if not name:
+                return False
+            if name in OVERLAY_ALLOWED_FILES:
+                return True
+            ext = os.path.splitext(name)[1].lower()
+            if ext in OVERLAY_ALLOWED_EXTENSIONS:
+                return True
+            return False
+
+        def do_GET(self):
+            if not self._is_allowed():
+                self.send_error(404)
+                return
+            super().do_GET()
+
+        def do_HEAD(self):
+            if not self._is_allowed():
+                self.send_error(404)
+                return
+            super().do_HEAD()
+
+        def list_directory(self, path):
+            self.send_error(404)
+            return None
+
+        def log_message(self, format, *args):
+            pass
+
+    class OverlayServer(socketserver.TCPServer):
+        allow_reuse_address = True
+
     try:
-        with socketserver.TCPServer(("", PORT), QuietHandler) as httpd:
+        with OverlayServer(("127.0.0.1", PORT), OverlayHandler) as httpd:
             print(f"[Overlay] Server running at: http://localhost:{PORT}/chat.html")
             httpd.serve_forever()
     except OSError:
@@ -2918,9 +3184,9 @@ def _vbm_run(args, **kwargs):
 
 
 COOLDOWN_START  = 120
-VOTES_JSON_FILE = "votes.json"
-VOTE_FILE_BAN   = "ban_vote.html"
-STATUS_FILE     = "newstatus.html"
+VOTES_JSON_FILE = _nexo_data_path("votes.json")
+VOTE_FILE_BAN   = _nexo_html_path("ban_vote.html")
+STATUS_FILE     = _nexo_html_path("newstatus.html")
 
 # Shared vote state written to votes.json (read by overlay.html)
 _votes_state = {
@@ -2946,7 +3212,7 @@ YOUTUBE_API_KEY    = ""   # Optional: YouTube Data API v3 key — enables the
                           # official chat backend in YouTubeChatSource
                           # (see the class above). Entered once in the
                           # GUI, saved to youtube_api_key_config.json.
-YOUTUBE_API_KEY_CONFIG_FILE = "youtube_api_key_config.json"
+YOUTUBE_API_KEY_CONFIG_FILE = _nexo_data_path("youtube_api_key_config.json")
 
 def load_youtube_api_key_config():
     global YOUTUBE_API_KEY
@@ -2973,7 +3239,7 @@ VIDEO_ID = ""
 VM_NAME  = ""
 
 # ========================= REAL PC CONTROL =========================
-REALPC_CONFIG_FILE = "realpc_config.json"
+REALPC_CONFIG_FILE = _nexo_data_path("realpc_config.json")
 REALPC_CONFIG = {
     "video_id":          "",       # YouTube video ID to listen on
     "enabled":           False,    # master on/off switch
@@ -3343,7 +3609,7 @@ _REALPC_BASE64_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{%d,}={0,2}" % _REALPC_BASE64
 # _REALPC_DANGEROUS_TEXT_PATTERNS / _REALPC_DANGEROUS_KEYS stays blocked by
 # default, same as before this feature existed. Persisted so choices
 # survive a restart.
-_REALPC_UNBLOCKED_PATTERNS_FILE = "realpc_unblocked_patterns.json"
+_REALPC_UNBLOCKED_PATTERNS_FILE = _nexo_data_path("realpc_unblocked_patterns.json")
 _REALPC_UNBLOCKED_PATTERNS = set()   # subset of _REALPC_DANGEROUS_TEXT_PATTERNS
 _REALPC_UNBLOCKED_KEYS     = set()   # subset of _REALPC_DANGEROUS_KEYS
 _REALPC_BASE64_RULE_ENABLED = True   # separate on/off for the base64-blob heuristic specifically
@@ -3995,7 +4261,7 @@ def stop_realpc_bot():
     _realpc_stop_event.set()
 
 # ========================= EVENT LOG =========================
-EVENT_LOG_FILE = "event_log.json"
+EVENT_LOG_FILE = _nexo_data_path("event_log.json")
 _event_log = []                # list of dicts written at runtime
 _event_log_lock = threading.Lock()
 
@@ -4040,7 +4306,7 @@ def load_event_log():
         _event_log = []
 
 # ========================= PERMISSIONS CONFIG =========================
-PERMISSIONS_CONFIG_FILE = "permissions_config.json"
+PERMISSIONS_CONFIG_FILE = _nexo_data_path("permissions_config.json")
 # Default required-votes table (overridden by GUI / config file)
 PERMISSIONS_CONFIG = {
     "restart_votes":   2,
@@ -4068,7 +4334,7 @@ def save_permissions_config():
         print(f"[Permissions] Save error: {e}")
 
 # ========================= SOUND & TTS CONFIG =========================
-SOUND_CONFIG_FILE = "sound_config.json"
+SOUND_CONFIG_FILE = _nexo_data_path("sound_config.json")
 SOUND_CONFIG = {
     "success_sound":    "success.mp3",
     "revert_sound":     "",
@@ -4117,7 +4383,7 @@ def play_event_sound(event_key: str):
     threading.Thread(target=_play, daemon=True).start()
 
 # ========================= NEXOAI (GROQ CHAT) CONFIG =========================
-NEXOAI_CONFIG_FILE = "nexoai_config.json"
+NEXOAI_CONFIG_FILE = _nexo_data_path("nexoai_config.json")
 NEXOAI_CONFIG_DEFAULT_PROMPT = (
     "You are NexoAI, the built-in AI assistant of Nexovative Control Center "
     "(a YouTube livestream chat-bot / VirtualBox control app). You run on "
@@ -4254,7 +4520,7 @@ def groq_chat_completion(api_key: str, model: str, messages: list):
 
 
 # ========================= MULTI-STREAM CONFIG =========================
-MULTI_STREAM_CONFIG_FILE = "multi_stream_config.json"
+MULTI_STREAM_CONFIG_FILE = _nexo_data_path("multi_stream_config.json")
 MULTI_STREAM_CONFIG = {
     "video_ids": [],       # list of YouTube video IDs to monitor simultaneously
 }
@@ -4279,7 +4545,7 @@ def save_multi_stream_config():
         print(f"[MultiStream] Save error: {e}")
 
 # ========================= SCHEDULER CONFIG =========================
-SCHEDULER_CONFIG_FILE = "scheduler_config.json"
+SCHEDULER_CONFIG_FILE = _nexo_data_path("scheduler_config.json")
 SCHEDULER_CONFIG = {
     "enabled": False,
     "tasks":   [],
@@ -4640,7 +4906,7 @@ def _reset_session_stats():
     _stats["bot_start_time"]   = time.time()
 
 # ========================= USER MANAGEMENT LISTS =========================
-USER_MGMT_FILE = "user_mgmt.json"
+USER_MGMT_FILE = _nexo_data_path("user_mgmt.json")
 whitelist_users = set()   # empty = disabled; non-empty = only these users can use commands
 vip_users       = {}      # {username: {"votes_needed": int}}
 
@@ -4679,12 +4945,12 @@ def save_user_mgmt():
     except Exception as e:
         print(f"[UserMgmt] Save error: {e}")
 AUTO_START_ENABLED = True   # if False, watchdog_restart will not auto-revive a powered-off VM
-AUTO_START_CONFIG_FILE = "auto_start_config.json"
+AUTO_START_CONFIG_FILE = _nexo_data_path("auto_start_config.json")
 
-APPEARANCE_CONFIG_FILE = "appearance_config.json"
+APPEARANCE_CONFIG_FILE = _nexo_data_path("appearance_config.json")
 
 # ========================= OBS WEBSOCKET =========================
-OBS_CONFIG_FILE = "obs_config.json"
+OBS_CONFIG_FILE = _nexo_data_path("obs_config.json")
 
 try:
     import obsws_python as obs
@@ -4881,7 +5147,7 @@ def save_auto_start_config():
 # the primary VM bot controls live, and the VM's screen is exactly what
 # gets shown on stream.
 VM_DANGER_FILTER_ENABLED = True
-VM_DANGER_FILTER_CONFIG_FILE = "vm_danger_filter_config.json"
+VM_DANGER_FILTER_CONFIG_FILE = _nexo_data_path("vm_danger_filter_config.json")
 
 def load_vm_danger_filter_config():
     global VM_DANGER_FILTER_ENABLED
@@ -4906,7 +5172,7 @@ def save_vm_danger_filter_config():
 VOTE_ACTION_COOLDOWN = 60          # seconds after a restart/revert before another can be voted
 
 # ========================= RECONNECT CONFIG =========================
-RECONNECT_CONFIG_FILE = "reconnect_config.json"
+RECONNECT_CONFIG_FILE = _nexo_data_path("reconnect_config.json")
 RECONNECT_CONFIG = {
     "max_failures":      10,    # stop bot after this many consecutive failures (0 = infinite)
     "base_delay":         5,    # seconds to wait after first failure
@@ -4940,8 +5206,8 @@ restart_cooldown_until = 0.0       # epoch time when restart cooldown expires
 revert_cooldown_until  = 0.0       # epoch time when revert cooldown expires
 
 # ========================= OS VOTING SYSTEM =========================
-OS_VOTING_CONFIG_FILE = "os_voting_config.json"
-OS_VOTE_STATUS_FILE   = "os_vote_status.html"
+OS_VOTING_CONFIG_FILE = _nexo_data_path("os_voting_config.json")
+OS_VOTE_STATUS_FILE   = _nexo_html_path("os_vote_status.html")
 OS_VOTE_REQUIRED      = 3
 OS_VOTE_TIMEOUT       = 120
 OS_VOTE_SLOTS         = 15
@@ -5481,6 +5747,20 @@ def handle_mouse(cmd, args):
         mouse, session = get_mouse_and_session()
         parts   = args.split()
         buttons = 0
+
+        # ── Chaos Events hook (v32.0): cursor_invert / click_swap ──
+        # While a chaos event has set _chaos_input_flip_until in the
+        # future, mirror relative left/right movement and swap which
+        # physical button left/right-click commands send. Purely
+        # additive — does nothing when no chaos event is active.
+        if time.time() < _chaos_input_flip_until:
+            if cmd in ('move', 'mouse', 'mv') and len(parts) == 2 and _both_look_like_ints(parts):
+                parts = [str(-int(parts[0])), parts[1]]
+            elif cmd in ('click', 'lclick'):
+                cmd = 'rclick'
+            elif cmd in ('rclick', 'rightclick'):
+                cmd = 'click'
+
         if cmd in ['move', 'mouse', 'mv']:
             if len(parts) == 2 and _both_look_like_ints(parts):
                 # Raw relative dx,dy form — unchanged from before:
@@ -5784,8 +6064,13 @@ class YouTubeChatBot:
         if "os_vote_timeout_checker" not in running_names:
             threading.Thread(target=os_vote_timeout_checker, daemon=True,
                              name="os_vote_timeout_checker").start()
+        if "chaos_vote_timeout_checker" not in running_names:
+            threading.Thread(target=chaos_vote_timeout_checker, daemon=True,
+                             name="chaos_vote_timeout_checker").start()
         if OS_VOTING_ENABLED:
             update_os_vote_status()
+        if CHAOS_CONFIG.get("enabled"):
+            update_chaos_status()
        # threading.Thread(target=fetch_youtube_stats, daemon=True).start()
 
     def reconnect(self):
@@ -5880,6 +6165,11 @@ class YouTubeChatBot:
                     active_users.add(c.author_name.strip())
                     print(f"[Chat] [{user}]: {msg}")
 
+                    # Chaos meter: counts every message while chaos + the
+                    # meter option are enabled, regardless of whether the
+                    # message itself is a command.
+                    chaos_register_message(user)
+
                     # Live Chat Viewer
                     _is_cmd     = msg.startswith("!")
                     _is_banned_ = (user in banned_users and
@@ -5951,6 +6241,16 @@ class YouTubeChatBot:
                                         print(f"[OSVoting] Threshold reached → switching to {target_entry['name']}")
                                         threading.Thread(target=switch_os, args=(target_entry,), daemon=True).start()
                                     continue
+
+                            # ── Chaos Events (v32.0) ──
+                            # !chaos           → cast a vote for a random enabled event
+                            # !chaos <name>    → cast a vote, requesting a specific event
+                            #                    (falls back to random if that key isn't
+                            #                    enabled or doesn't exist)
+                            if cmd == "chaos" and CHAOS_CONFIG.get("enabled"):
+                                requested = args.strip().lower().replace(" ", "_") or None
+                                chaos_register_vote(user, requested_key=requested)
+                                continue
 
                             # ── Hidden attribution/verification command ──
                             # Deliberately undocumented — not shown in any
@@ -6246,6 +6546,393 @@ class YouTubeChatBot:
             try: self.chat.terminate()
             except: pass
         print("[Bot] Stopped.")
+
+
+# ========================= CHAOS EVENTS (v32.0) =========================
+# Chat-triggered "chaos events": short, high-visibility bursts of on-screen
+# mayhem played out on the VM window that's currently in focus. Everything
+# here rides on top of systems that already exist elsewhere in this file —
+# it does not invent a new execution path:
+#   - vote tallying/cooldown   -> same shape as OS_VOTING's os_votes dict
+#   - actually doing anything  -> send_keyboard() / handle_mouse() /
+#                                 send_scancode(), the exact same host-side
+#                                 input-injection functions the normal chat
+#                                 commands already use against the VM window
+#   - the "chaos meter" HUD    -> a standalone HTML file, same pattern as
+#                                 OS_VOTE_STATUS_FILE / newstatus.html
+#   - sound/TTS                -> play_event_sound() / speak_text()
+#   - history                  -> _append_event()
+# Nothing here touches the guest OS through guestcontrol or any channel the
+# host doesn't already use — it is host-side input aimed at the VM window,
+# so its blast radius is identical to (not larger than) the existing chat
+# mouse/keyboard commands.
+import random as _random
+
+CHAOS_CONFIG_FILE = _nexo_data_path("chaos_config.json")
+CHAOS_STATUS_FILE = _nexo_html_path("chaos_status.html")
+
+CHAOS_CONFIG = {
+    "enabled":            False,
+    "vote_required":      3,        # chat votes needed to fire an event
+    "vote_timeout":       45,       # seconds a vote stays open before expiring
+    "cooldown":           60,       # seconds after an event before another can start
+    "meter_enabled":      False,    # auto-fire when the passive meter fills up
+    "meter_per_message":  1,        # meter points gained per chat message while live
+    "meter_threshold":    100,      # meter value that triggers an auto event
+    "announce_tts":       True,     # speak the event name when it fires
+    "countdown_seconds":  3,        # on-screen countdown before the event runs
+    "enabled_events":     [         # event keys the pool draws from; edit in GUI
+        "icon_shuffle", "popup_swarm", "cursor_invert",
+        "click_swap", "window_shake", "fake_error",
+    ],
+}
+
+# Registry of available chaos events. Each entry is small and self-contained
+# on purpose — new events can be added here without touching the engine.
+CHAOS_EVENTS = {
+    "icon_shuffle": {
+        "label":    "Icon Shuffle",
+        "desc":     "Nudges the cursor around in short bursts for a few seconds.",
+        "duration": 4,
+    },
+    "popup_swarm": {
+        "label":    "Popup Swarm",
+        "desc":     "Opens a burst of Notepad windows in quick succession.",
+        "duration": 5,
+    },
+    "cursor_invert": {
+        "label":    "Cursor Invert",
+        "desc":     "Mouse movement is mirrored (left<->right) for a short window.",
+        "duration": 8,
+    },
+    "click_swap": {
+        "label":    "Click Swap",
+        "desc":     "Left and right click are swapped for a short window.",
+        "duration": 8,
+    },
+    "window_shake": {
+        "label":    "Window Shake",
+        "desc":     "Rapidly nudges the active window's position back and forth.",
+        "duration": 4,
+    },
+    "fake_error": {
+        "label":    "Fake Error",
+        "desc":     "Shows a harmless fake Windows-style error dialog with a sound.",
+        "duration": 3,
+    },
+}
+
+chaos_votes             = set()     # usernames who voted for the current event
+chaos_vote_start_time   = None
+chaos_meter_value       = 0
+chaos_last_fired_time   = 0.0
+chaos_event_in_progress = False
+chaos_lock = threading.Lock()
+_chaos_input_flip_until = 0.0       # epoch time; while >now, mouse handlers should invert/swap
+
+
+def load_chaos_config():
+    global CHAOS_CONFIG
+    try:
+        if os.path.exists(CHAOS_CONFIG_FILE):
+            with open(CHAOS_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            CHAOS_CONFIG.update(data)
+            print("[Chaos] Config loaded.")
+    except Exception as e:
+        print(f"[Chaos] Load error: {e}")
+
+
+def save_chaos_config():
+    try:
+        with open(CHAOS_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(CHAOS_CONFIG, f, indent=2)
+        print("[Chaos] Config saved.")
+    except Exception as e:
+        print(f"[Chaos] Save error: {e}")
+
+
+def _chaos_pool():
+    """Currently-enabled event keys, filtered against the registry."""
+    return [k for k in CHAOS_CONFIG.get("enabled_events", []) if k in CHAOS_EVENTS]
+
+
+def update_chaos_status(countdown=None, event_key=None):
+    """
+    Writes the chaos meter / vote HUD to CHAOS_STATUS_FILE for the stream
+    overlay (add it as a Browser Source in OBS, same as the other *.html
+    overlays this app already writes).
+    """
+    required = CHAOS_CONFIG.get("vote_required", 3)
+    count    = len(chaos_votes)
+    pct_vote = min(100, int(count / required * 100)) if required else 0
+    meter_on = CHAOS_CONFIG.get("meter_enabled", False)
+    pct_meter = min(100, int(chaos_meter_value / max(1, CHAOS_CONFIG.get("meter_threshold", 100)) * 100))
+
+    countdown_html = ""
+    if countdown is not None and event_key:
+        ev_label = CHAOS_EVENTS.get(event_key, {}).get("label", "Chaos Event")
+        countdown_html = f"""
+        <div id="countdown">
+          <div id="cd-title">&#9889; CHAOS EVENT</div>
+          <div id="cd-name">{ev_label}</div>
+          <div id="cd-num">{countdown}</div>
+        </div>"""
+
+    meter_html = ""
+    if meter_on:
+        meter_html = (
+            f'<div class="row-label"><span>Meter</span>'
+            f'<span>{chaos_meter_value}/{CHAOS_CONFIG.get("meter_threshold", 100)}</span></div>'
+            f'<div class="bar-wrap"><div class="bar" style="width:{pct_meter}%;'
+            f'background:#ffb84d;"></div></div>'
+        )
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    *{{box-sizing:border-box;margin:0;padding:0;}}
+    body{{
+      background:transparent;
+      font-family:'Segoe UI',Arial,sans-serif;
+      color:white;
+      text-shadow:1px 1px 3px rgba(0,0,0,0.9);
+      padding:12px;
+    }}
+    #panel{{
+      background:rgba(20,8,8,0.82);
+      border:1px solid rgba(255,90,90,0.5);
+      border-radius:18px;
+      padding:18px 20px;
+      min-width:240px;
+      max-width:300px;
+      backdrop-filter:blur(6px);
+    }}
+    #title{{
+      font-size:20px;
+      font-weight:700;
+      color:#ff8a8a;
+      letter-spacing:1px;
+      text-align:center;
+      margin-bottom:10px;
+    }}
+    .bar-wrap{{
+      background:rgba(255,255,255,0.1);
+      border-radius:9px;
+      height:18px;
+      overflow:hidden;
+      margin-bottom:6px;
+    }}
+    .bar{{
+      height:100%;
+      border-radius:9px;
+      transition:width 0.4s ease;
+      min-width:4px;
+      background:#ff5a5a;
+    }}
+    .row-label{{
+      font-size:12px;
+      color:#ddd;
+      display:flex;
+      justify-content:space-between;
+      margin-bottom:4px;
+    }}
+    #countdown{{
+      text-align:center;
+      margin-top:10px;
+      padding-top:10px;
+      border-top:1px solid rgba(255,255,255,0.15);
+    }}
+    #cd-title{{font-size:14px;color:#ff8a8a;letter-spacing:2px;}}
+    #cd-name{{font-size:18px;font-weight:700;margin:4px 0;}}
+    #cd-num{{font-size:36px;font-weight:900;color:#fff;}}
+    </style></head><body>
+    <div id="panel">
+      <div id="title">&#9889; Chaos</div>
+      <div class="row-label"><span>Votes</span><span>{count}/{required}</span></div>
+      <div class="bar-wrap"><div class="bar" style="width:{pct_vote}%;"></div></div>
+      {meter_html}
+      {countdown_html}
+    </div>
+    <script>setInterval(()=>location.reload(),4000);</script>
+    </body></html>"""
+    try:
+        with open(CHAOS_STATUS_FILE, "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception as e:
+        print(f"[Chaos] Status write error: {e}")
+
+
+def chaos_register_message(user):
+    """Called for every chat message while chaos is enabled — feeds the passive meter."""
+    global chaos_meter_value
+    if not CHAOS_CONFIG.get("enabled") or not CHAOS_CONFIG.get("meter_enabled"):
+        return
+    fire_key = None
+    with chaos_lock:
+        chaos_meter_value += CHAOS_CONFIG.get("meter_per_message", 1)
+        threshold = CHAOS_CONFIG.get("meter_threshold", 100)
+        if chaos_meter_value >= threshold and not chaos_event_in_progress:
+            chaos_meter_value = 0
+            pool = _chaos_pool()
+            if pool:
+                fire_key = _random.choice(pool)
+    if fire_key:
+        threading.Thread(target=fire_chaos_event, args=(fire_key,), daemon=True).start()
+    update_chaos_status()
+
+
+def chaos_register_vote(user, requested_key=None):
+    """
+    Called on !chaos (or !chaos <eventname>) from chat. Returns nothing —
+    fires the event itself once the vote threshold is met.
+    """
+    global chaos_vote_start_time
+    if not CHAOS_CONFIG.get("enabled") or chaos_event_in_progress:
+        return
+    if time.time() - chaos_last_fired_time < CHAOS_CONFIG.get("cooldown", 60):
+        return
+    fire_key = None
+    with chaos_lock:
+        if not chaos_votes:
+            chaos_vote_start_time = time.time()
+        chaos_votes.add(user)
+        count    = len(chaos_votes)
+        required = CHAOS_CONFIG.get("vote_required", 3)
+        if count >= required:
+            pool = _chaos_pool()
+            if pool:
+                fire_key = requested_key if (requested_key in pool) else _random.choice(pool)
+                chaos_votes.clear()
+    update_chaos_status()
+    print(f"[Chaos] Vote {count}/{required} (by {user})")
+    if fire_key:
+        threading.Thread(target=fire_chaos_event, args=(fire_key,), daemon=True).start()
+
+
+def chaos_vote_timeout_checker():
+    """Background thread: clears a stale chaos vote after CHAOS_CONFIG['vote_timeout']."""
+    global chaos_vote_start_time
+    while not bot_stop_event.is_set():
+        if bot_stop_event.wait(1):
+            break
+        if chaos_vote_start_time is not None:
+            if time.time() - chaos_vote_start_time > CHAOS_CONFIG.get("vote_timeout", 45):
+                with chaos_lock:
+                    chaos_votes.clear()
+                    chaos_vote_start_time = None
+                update_chaos_status()
+    print("[Chaos] Vote timeout checker stopped.")
+
+
+def _chaos_run_icon_shuffle(duration):
+    # Gentle cursor jiggle via the same handle_mouse() path normal chat
+    # commands use — no filesystem or icon-position writes involved.
+    end = time.time() + duration
+    while time.time() < end:
+        dx, dy = _random.randint(-40, 40), _random.randint(-40, 40)
+        handle_mouse("move", f"{dx} {dy}")
+        time.sleep(0.3)
+
+
+def _chaos_run_popup_swarm(duration):
+    count = max(1, int(duration))
+    for _ in range(count):
+        try:
+            subprocess.Popen(["notepad.exe"])
+        except Exception as e:
+            print(f"[Chaos] popup_swarm error: {e}")
+        time.sleep(0.6)
+
+
+def _chaos_run_cursor_invert(duration):
+    # Sets the flip window; handle_mouse() consults _chaos_input_flip_until
+    # (see the small hook added at the top of handle_mouse) to mirror moves.
+    global _chaos_input_flip_until
+    _chaos_input_flip_until = time.time() + duration
+    time.sleep(duration)
+
+
+def _chaos_run_click_swap(duration):
+    # Reuses the same flip flag as cursor_invert — handle_mouse() also uses
+    # it to swap which physical button a "click"/"rclick" command sends.
+    global _chaos_input_flip_until
+    _chaos_input_flip_until = time.time() + duration
+    time.sleep(duration)
+
+
+def _chaos_run_window_shake(duration):
+    end = time.time() + duration
+    while time.time() < end:
+        handle_mouse("dragrel", "15 0")
+        time.sleep(0.15)
+        handle_mouse("dragrel", "-15 0")
+        time.sleep(0.15)
+
+
+def _chaos_run_fake_error(duration):
+    try:
+        import ctypes
+        play_event_sound("chaos_fake_error_sound")
+        threading.Thread(
+            target=lambda: ctypes.windll.user32.MessageBoxW(
+                0,
+                "A required system component stopped responding.\n\n"
+                "(This is a harmless chaos-event popup — nothing is wrong.)",
+                "System Notice", 0x30
+            ),
+            daemon=True
+        ).start()
+    except Exception as e:
+        print(f"[Chaos] fake_error error: {e}")
+    time.sleep(min(duration, 1))
+
+
+_CHAOS_RUNNERS = {
+    "icon_shuffle":  _chaos_run_icon_shuffle,
+    "popup_swarm":   _chaos_run_popup_swarm,
+    "cursor_invert": _chaos_run_cursor_invert,
+    "click_swap":    _chaos_run_click_swap,
+    "window_shake":  _chaos_run_window_shake,
+    "fake_error":    _chaos_run_fake_error,
+}
+
+
+def fire_chaos_event(event_key):
+    """
+    Runs the full lifecycle of one chaos event: countdown -> execute -> log.
+    Safe to call from any thread; does its own locking.
+    """
+    global chaos_event_in_progress, chaos_last_fired_time
+    if event_key not in CHAOS_EVENTS:
+        return
+    with chaos_lock:
+        if chaos_event_in_progress:
+            return
+        chaos_event_in_progress = True
+
+    try:
+        ev = CHAOS_EVENTS[event_key]
+        countdown_secs = max(0, int(CHAOS_CONFIG.get("countdown_seconds", 3)))
+        for remaining in range(countdown_secs, 0, -1):
+            update_chaos_status(countdown=remaining, event_key=event_key)
+            time.sleep(1)
+
+        if CHAOS_CONFIG.get("announce_tts", True):
+            speak_text(f"Chaos event: {ev['label']}")
+        play_event_sound("chaos_start_sound")
+        obs_trigger("chaos_event")
+        _append_event("CHAOS_EVENT", "vote/meter", ev["label"])
+        notify("Chaos Event!", ev["label"])
+
+        runner = _CHAOS_RUNNERS.get(event_key)
+        if runner:
+            runner(ev.get("duration", 4))
+
+    except Exception as e:
+        print(f"[Chaos] Event '{event_key}' error: {e}")
+    finally:
+        chaos_last_fired_time = time.time()
+        chaos_event_in_progress = False
+        update_chaos_status()
 
 
 # ========================= SECONDARY STREAM BOT =========================
@@ -6716,7 +7403,17 @@ class NexovativeControlCenter:
         tab14 = ttk.Frame(nb)
         tab15 = ttk.Frame(nb)
         tab16 = ttk.Frame(nb)
+        # New in v32.0. Kept as a distinct variable (tab17) rather than
+        # renumbered into the tab1..tab16 sequence above, specifically so
+        # every existing numeric index used elsewhere in this file (the
+        # _lazy_tab_save_fns / save_map / _lazy_guarded_indices dicts, the
+        # unsaved-changes guard comment, etc.) keeps meaning exactly what
+        # it always has. Only where a tab is added does its screen position
+        # depend on order (nb.add() below); its index used everywhere else
+        # is whatever nb.index() reports at runtime for tab17 specifically.
+        tab17 = ttk.Frame(nb)
         nb.add(tab1,  text="▶ Main")
+        nb.add(tab17, text="⚡ Chaos")
         nb.add(tab2,  text="⚙ Cmds")
         nb.add(tab3,  text="🖥 VM")
         nb.add(tab4,  text="🗳 OS Vote")
@@ -6733,10 +7430,12 @@ class NexovativeControlCenter:
         nb.add(tab15, text="🔄 Reconnect")
         nb.add(tab16, text="🤖 NexoAI")
         self._fun_tab_anchor = tab15   # hidden Fun tab (easter egg) is inserted right before this one
+        self._chaos_tab_idx  = lambda: nb.index(tab17)   # resolved lazily; avoids hardcoding a number
 
         if not APP_LITE_MODE:
             # ── Full GUI Mode: build every tab immediately, as before. ──
             self._build_main_tab(tab1)
+            self._build_chaos_tab(tab17)
             self._build_cmd_builder_tab(tab2)
             self._build_vm_controls_tab(tab3)
             self._build_os_voting_tab(tab4)
@@ -6761,6 +7460,7 @@ class NexovativeControlCenter:
             # "one extra tab's worth" at any given moment, instead of
             # accumulating every tab you've ever visited.
             self._build_main_tab(tab1)
+            self._build_chaos_tab(tab17)
             self._build_vm_controls_tab(tab3)
             self._build_realpc_tab(tab14)
 
@@ -6781,15 +7481,18 @@ class NexovativeControlCenter:
             }
             # Maps tab index -> the frame's own "unsaved changes" save
             # function, so we can offer to save before tearing a tab down.
+            # NOTE: built from frame objects (via nb.index(frame)), not
+            # typed as literal numbers, so this map stays correct no matter
+            # what position a tab (e.g. the v32.0 Chaos tab) is inserted at.
             self._lazy_tab_save_fns = {
-                1:  self._save_cmd,
-                3:  self._save_os_voting_config,
-                5:  self._obs_save,
-                9:  self._save_permissions,
-                10: self._save_sound_config,
-                11: self._ms_save,
-                12: self._sched_save,
-                14: self._save_reconnect_config,
+                nb.index(tab2):  self._save_cmd,
+                nb.index(tab4):  self._save_os_voting_config,
+                nb.index(tab6):  self._obs_save,
+                nb.index(tab10): self._save_permissions,
+                nb.index(tab11): self._save_sound_config,
+                nb.index(tab12): self._ms_save,
+                nb.index(tab13): self._sched_save,
+                nb.index(tab15): self._save_reconnect_config,
             }
             self._lazy_tab_currently_built = None   # the one lazy frame that's live right now
 
@@ -6866,15 +7569,21 @@ class NexovativeControlCenter:
         self.root.after(5000 if APP_LITE_MODE else 1000, self._refresh_stats_display)
 
         # ── Unsaved-changes guard: intercept tab switches ──
-        # Tab indices that can have unsaved state (matched by name text prefix):
-        # 1=Commands, 3=OS Voting, 5=OBS, 9=Permissions, 10=Sound&TTS,
-        # 11=Multi-Stream, 12=Scheduler, 13=Real PC, 14=Reconnect
-        # NOTE: in Lite Mode, indices 1,3,5,9,10,11,12,14 are lazy tabs whose
-        # unsaved-changes check + save-prompt is already handled by
-        # _build_tab_on_first_view right before it tears the tab down. Only
-        # index 13 (Real PC) is always eagerly built, so it's the only one
-        # this guard still needs to handle when Lite Mode is on.
-        _lazy_guarded_indices = {1, 3, 5, 9, 10, 11, 12, 14}
+        # Tab indices that can have unsaved state. Resolved from the frame
+        # objects (nb.index(tabN)) rather than hardcoded, so this stays
+        # correct regardless of where a tab (e.g. v32.0's Chaos tab) sits
+        # in the notebook's left-to-right order.
+        # tab2=Commands, tab4=OS Voting, tab6=OBS, tab10=Permissions,
+        # tab11=Sound&TTS, tab12=Multi-Stream, tab13=Scheduler,
+        # tab14=Real PC, tab15=Reconnect, tab17=Chaos
+        # NOTE: in Lite Mode, the lazy-tab indices below are already
+        # handled by _build_tab_on_first_view right before it tears the
+        # tab down. Only Real PC and Chaos are always eagerly built, so
+        # they're the ones this guard still needs to handle in Lite Mode.
+        _lazy_guarded_indices = {
+            nb.index(tab2), nb.index(tab4), nb.index(tab6), nb.index(tab10),
+            nb.index(tab11), nb.index(tab12), nb.index(tab13), nb.index(tab15),
+        }
 
         def _on_tab_changed(event):
             try:
@@ -6894,17 +7603,20 @@ class NexovativeControlCenter:
                         "Save before switching tabs?"
                     )
                     if answer:
-                        # Route to the correct save method based on old tab index
+                        # Route to the correct save method based on old tab index.
+                        # Built from frame objects, not literal numbers — see
+                        # note above _lazy_guarded_indices.
                         save_map = {
-                            1:  self._save_cmd,
-                            3:  self._save_os_voting_config,
-                            5:  self._obs_save,
-                            9:  self._save_permissions,
-                            10: self._save_sound_config,
-                            11: self._ms_save,
-                            12: self._sched_save,
-                            13: self._rpc_save,
-                            14: self._save_reconnect_config,
+                            nb.index(tab2):  self._save_cmd,
+                            nb.index(tab4):  self._save_os_voting_config,
+                            nb.index(tab6):  self._obs_save,
+                            nb.index(tab10): self._save_permissions,
+                            nb.index(tab11): self._save_sound_config,
+                            nb.index(tab12): self._ms_save,
+                            nb.index(tab13): self._sched_save,
+                            nb.index(tab14): self._rpc_save,
+                            nb.index(tab15): self._save_reconnect_config,
+                            nb.index(tab17): self._save_chaos_config,
                         }
                         save_fn = save_map.get(old_idx)
                         if save_fn:
@@ -7255,6 +7967,254 @@ class NexovativeControlCenter:
             except Exception:
                 pass
         self.root.after(0, _do)
+
+    # ──────────────── TAB : CHAOS EVENTS (v32.0) ────────────────
+    def _build_chaos_tab(self, parent):
+        """
+        Chat-triggered chaos events: viewers vote (!chaos) or a passive
+        meter fills up from chat activity, and a random enabled event
+        from CHAOS_EVENTS fires — a short, visible burst played out via
+        the same host-side mouse/keyboard functions the normal chat
+        commands already use.
+        """
+        parent.configure(style="TFrame")
+
+        # ── Scrollable canvas wrapper ──
+        # Without this, everything below the window height (including the
+        # Save button) is clipped and cannot be reached.
+        _canvas = tk.Canvas(parent, bg=self.BG, highlightthickness=0)
+        _vscroll = ttk.Scrollbar(parent, orient="vertical", command=_canvas.yview)
+        _canvas.configure(yscrollcommand=_vscroll.set)
+        _vscroll.pack(side="right", fill="y")
+        _canvas.pack(side="left", fill="both", expand=True)
+
+        _inner = tk.Frame(_canvas, bg=self.BG)
+        _inner_win = _canvas.create_window((0, 0), window=_inner, anchor="nw")
+
+        def _on_inner_cfg(e):
+            _canvas.configure(scrollregion=_canvas.bbox("all"))
+
+        def _on_canvas_cfg(e):
+            _canvas.itemconfig(_inner_win, width=e.width)
+
+        def _on_wheel(e):
+            # Do nothing when all content already fits (nothing to scroll).
+            first, last = _canvas.yview()
+            if first <= 0.0 and last >= 1.0:
+                return "break"
+            _canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            return "break"
+
+        _inner.bind("<Configure>", _on_inner_cfg)
+        _canvas.bind("<Configure>", _on_canvas_cfg)
+
+        # Everything below is built into _inner instead of the tab frame.
+        # `parent` is re-pointed so the rest of the method stays unchanged.
+        parent = _inner
+
+        hdr = tk.Frame(parent, bg=self.BG)
+        hdr.pack(fill="x", padx=16, pady=(14, 4))
+        tk.Label(hdr, text="⚡  Chaos Events",
+                 bg=self.BG, fg=self.ACCENT,
+                 font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        tk.Label(hdr,
+                 text="Let chat vote to trigger short, visible chaos bursts on the VM window — "
+                      "or let a passive meter fill up from chat activity and fire one automatically.",
+                 bg=self.BG, fg=self.TEXTDIM,
+                 font=("Segoe UI", 9), wraplength=560, justify="left").pack(anchor="w", pady=(2, 0))
+
+        # ── Enable toggle ──
+        toggle_card = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        toggle_card.pack(fill="x", padx=12, pady=(10, 6))
+        self._chaos_enabled_var = tk.BooleanVar(value=CHAOS_CONFIG.get("enabled", False))
+        tk.Checkbutton(toggle_card, text="Enable Chaos Events  (adds !chaos to chat commands)",
+                       variable=self._chaos_enabled_var,
+                       bg=self.BG2, fg=self.TEXT,
+                       selectcolor=self.BG3,
+                       activebackground=self.BG2, activeforeground=self.TEXT,
+                       font=("Segoe UI", 10, "bold")).pack(anchor="w")
+
+        # ── Vote / cooldown settings ──
+        settings_card = ttk.Frame(parent, style="Card.TFrame", padding=20)
+        settings_card.pack(fill="x", padx=12, pady=(0, 6))
+
+        ROWS = [
+            ("vote_required",     "Votes required",
+             "How many distinct chat users must type !chaos before an event fires."),
+            ("vote_timeout",      "Vote timeout (seconds)",
+             "Votes are cleared if this many seconds pass without reaching the threshold."),
+            ("cooldown",          "Cooldown after an event (seconds)",
+             "Minimum time between one chaos event ending and the next one being allowed to start."),
+            ("countdown_seconds", "On-screen countdown (seconds)",
+             "How long the \"CHAOS EVENT incoming\" countdown shows on the overlay before it runs."),
+        ]
+        self._chaos_vars = {}
+        for row_i, (key, label, hint) in enumerate(ROWS):
+            tk.Label(settings_card, text=label,
+                     bg=self.BG2, fg=self.TEXT,
+                     font=("Segoe UI", 10, "bold")).grid(
+                     row=row_i * 2, column=0, sticky="w",
+                     pady=(14 if row_i else 0, 0))
+            tk.Label(settings_card, text=hint,
+                     bg=self.BG2, fg=self.TEXTDIM,
+                     font=("Segoe UI", 8),
+                     wraplength=460, justify="left").grid(
+                     row=row_i * 2 + 1, column=0, sticky="w", padx=(16, 0))
+            var = tk.IntVar(value=CHAOS_CONFIG.get(key, 0))
+            self._chaos_vars[key] = var
+            tk.Spinbox(settings_card, textvariable=var,
+                       from_=0, to=600, width=7,
+                       bg=self.BG3, fg=self.TEXT,
+                       insertbackground=self.TEXT,
+                       buttonbackground=self.BG3,
+                       font=("Segoe UI", 12, "bold"),
+                       relief="flat", bd=1).grid(
+                       row=row_i * 2, column=1, rowspan=2,
+                       padx=(24, 0), pady=(14 if row_i else 0, 0), sticky="n")
+        settings_card.columnconfigure(0, weight=1)
+
+        self._chaos_tts_var = tk.BooleanVar(value=CHAOS_CONFIG.get("announce_tts", True))
+        tk.Checkbutton(settings_card, text="Announce event name via TTS when it fires",
+                       variable=self._chaos_tts_var,
+                       bg=self.BG2, fg=self.TEXT,
+                       selectcolor=self.BG3,
+                       activebackground=self.BG2, activeforeground=self.TEXT,
+                       font=("Segoe UI", 9)).grid(
+                       row=len(ROWS) * 2, column=0, columnspan=2,
+                       sticky="w", pady=(16, 0))
+
+        # ── Passive meter ──
+        meter_card = ttk.Frame(parent, style="Card.TFrame", padding=20)
+        meter_card.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(meter_card, text="Passive Chaos Meter",
+                 bg=self.BG2, fg=self.ACCENT,
+                 font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
+        self._chaos_meter_var = tk.BooleanVar(value=CHAOS_CONFIG.get("meter_enabled", False))
+        tk.Checkbutton(meter_card,
+                       text="Also auto-fire an event when chat activity fills the meter (no voting needed)",
+                       variable=self._chaos_meter_var,
+                       bg=self.BG2, fg=self.TEXT,
+                       selectcolor=self.BG3,
+                       activebackground=self.BG2, activeforeground=self.TEXT,
+                       font=("Segoe UI", 9)).grid(
+                       row=1, column=0, columnspan=2, sticky="w", pady=(8, 12))
+
+        tk.Label(meter_card, text="Points per chat message",
+                 bg=self.BG2, fg=self.TEXT, font=("Segoe UI", 9)).grid(
+                 row=2, column=0, sticky="w")
+        self._chaos_meter_pts_var = tk.IntVar(value=CHAOS_CONFIG.get("meter_per_message", 1))
+        tk.Spinbox(meter_card, textvariable=self._chaos_meter_pts_var,
+                   from_=1, to=50, width=6,
+                   bg=self.BG3, fg=self.TEXT, insertbackground=self.TEXT,
+                   buttonbackground=self.BG3, relief="flat", bd=1).grid(
+                   row=2, column=1, sticky="w", padx=(12, 0))
+
+        tk.Label(meter_card, text="Meter threshold (fires at this value)",
+                 bg=self.BG2, fg=self.TEXT, font=("Segoe UI", 9)).grid(
+                 row=3, column=0, sticky="w", pady=(8, 0))
+        self._chaos_meter_thresh_var = tk.IntVar(value=CHAOS_CONFIG.get("meter_threshold", 100))
+        tk.Spinbox(meter_card, textvariable=self._chaos_meter_thresh_var,
+                   from_=10, to=100000, increment=10, width=8,
+                   bg=self.BG3, fg=self.TEXT, insertbackground=self.TEXT,
+                   buttonbackground=self.BG3, relief="flat", bd=1).grid(
+                   row=3, column=1, sticky="w", padx=(12, 0), pady=(8, 0))
+
+        # ── Event pool ──
+        pool_card = ttk.Frame(parent, style="Card.TFrame", padding=20)
+        pool_card.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(pool_card, text="Enabled Events",
+                 bg=self.BG2, fg=self.ACCENT,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        tk.Label(pool_card, text="Random events are drawn only from those checked below.",
+                 bg=self.BG2, fg=self.TEXTDIM, font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 8))
+
+        self._chaos_event_vars = {}
+        enabled_set = set(CHAOS_CONFIG.get("enabled_events", []))
+        for key, ev in CHAOS_EVENTS.items():
+            row = tk.Frame(pool_card, bg=self.BG2)
+            row.pack(fill="x", pady=3)
+            var = tk.BooleanVar(value=(key in enabled_set))
+            self._chaos_event_vars[key] = var
+            tk.Checkbutton(row, text=ev["label"],
+                           variable=var,
+                           bg=self.BG2, fg=self.TEXT,
+                           selectcolor=self.BG3,
+                           activebackground=self.BG2, activeforeground=self.TEXT,
+                           font=("Segoe UI", 9, "bold"), width=16, anchor="w").pack(side="left")
+            tk.Label(row, text=ev["desc"],
+                     bg=self.BG2, fg=self.TEXTDIM,
+                     font=("Segoe UI", 8), wraplength=380, justify="left").pack(side="left", padx=(8, 0))
+
+        # ── Dirty-tracking + Save ──
+        all_vars = (list(self._chaos_vars.values()) + [self._chaos_enabled_var, self._chaos_tts_var,
+                    self._chaos_meter_var, self._chaos_meter_pts_var, self._chaos_meter_thresh_var]
+                    + list(self._chaos_event_vars.values()))
+        self._trace_dirty(self._chaos_tab_idx(), *all_vars)
+
+        btn_row = tk.Frame(parent, bg=self.BG)
+        btn_row.pack(fill="x", padx=12, pady=(10, 0))
+        ttk.Button(btn_row, text="💾 Save Chaos Config",
+                   style="Green.TButton",
+                   command=self._save_chaos_config).pack(side="left")
+        ttk.Button(btn_row, text="⚡ Test-fire a random event now",
+                   style="Dim.TButton",
+                   command=self._test_fire_chaos_event).pack(side="left", padx=(10, 0))
+
+        self._chaos_saved_lbl = tk.Label(parent, text="",
+                                         bg=self.BG, fg=self.GREEN,
+                                         font=("Segoe UI", 9))
+        self._chaos_saved_lbl.pack(anchor="w", padx=16, pady=(4, 20))
+
+        # ── Mouse wheel on every child widget ──
+        # Tk delivers <MouseWheel> only to the widget under the cursor, so
+        # the wheel must be bound on each descendant, otherwise scrolling
+        # only works over empty background. Spinboxes get the same handler
+        # so the page scrolls instead of the number changing by accident.
+        def _bind_wheel_recursive(w):
+            w.bind("<MouseWheel>", _on_wheel)
+            for child in w.winfo_children():
+                _bind_wheel_recursive(child)
+
+        _bind_wheel_recursive(_inner)
+        _canvas.bind("<MouseWheel>", _on_wheel)
+
+    def _save_chaos_config(self):
+        CHAOS_CONFIG["enabled"]           = bool(self._chaos_enabled_var.get())
+        CHAOS_CONFIG["announce_tts"]      = bool(self._chaos_tts_var.get())
+        CHAOS_CONFIG["meter_enabled"]     = bool(self._chaos_meter_var.get())
+        for key, var in self._chaos_vars.items():
+            try:
+                CHAOS_CONFIG[key] = max(0, int(var.get()))
+            except (ValueError, tk.TclError):
+                pass
+        try:
+            CHAOS_CONFIG["meter_per_message"] = max(1, int(self._chaos_meter_pts_var.get()))
+            CHAOS_CONFIG["meter_threshold"]   = max(1, int(self._chaos_meter_thresh_var.get()))
+        except (ValueError, tk.TclError):
+            pass
+        CHAOS_CONFIG["enabled_events"] = [k for k, v in self._chaos_event_vars.items() if v.get()]
+
+        save_chaos_config()
+        self._clear_dirty(self._chaos_tab_idx())
+        if CHAOS_CONFIG.get("enabled"):
+            update_chaos_status()
+        self._chaos_saved_lbl.configure(
+            text=f"Saved — enabled:{CHAOS_CONFIG['enabled']}  "
+                 f"votes:{CHAOS_CONFIG['vote_required']}  "
+                 f"cooldown:{CHAOS_CONFIG['cooldown']}s  "
+                 f"events:{len(CHAOS_CONFIG['enabled_events'])}")
+        self._log("[Chaos] Config saved.")
+
+    def _test_fire_chaos_event(self):
+        """Manual test button — fires one random enabled event immediately, bypassing votes/cooldown."""
+        pool = [k for k, v in self._chaos_event_vars.items() if v.get()]
+        if not pool:
+            messagebox.showinfo("Chaos Events", "Check at least one event in the list first.")
+            return
+        key = _random.choice(pool)
+        threading.Thread(target=fire_chaos_event, args=(key,), daemon=True).start()
+        self._log(f"[Chaos] Test-fired: {CHAOS_EVENTS[key]['label']}")
+
     def _build_cmd_builder_tab(self, parent):
         parent.configure(style="TFrame")
 
@@ -12815,6 +13775,7 @@ if __name__ == '__main__':
     load_realpc_unblocked_patterns()
     load_reconnect_config()
     load_nexoai_config()
+    load_chaos_config()
     load_vm_danger_filter_config()
     load_youtube_api_key_config()
     _update_splash(97, "Building interface...")
@@ -12827,7 +13788,7 @@ if __name__ == '__main__':
 
     _update_splash(100, "Ready!")
     time.sleep(0.25)    # let the user see 100% for a moment
-    if not APP_LITE_MODE:
+    if not APP_LITE_MODE and _splash_proc is None:
         if APP_EXTENDED_INTRO:
             _play_extended_intro_animation()   # ~8s full-screen cinematic intro
         else:
