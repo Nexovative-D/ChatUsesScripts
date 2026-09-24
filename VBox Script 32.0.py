@@ -2626,8 +2626,26 @@ def _show_gui_from_tray(icon, item):
         _gui_root.after(0, _gui_root.deiconify)
         _gui_root.after(0, _gui_root.lift)
 
+def _shutdown_vmware_child():
+    """
+    Stops the separately-running VMware script (if the VMware tab started
+    it). Needed because both exit paths below end in os._exit(0), which
+    skips atexit handlers and would otherwise leave that process orphaned.
+    Never raises.
+    """
+    try:
+        gui = _gui_root
+        app_obj = getattr(gui, "_nexo_app", None) if gui else None
+        vt = getattr(app_obj, "_vmware_tab", None)
+        if vt is not None:
+            vt.shutdown()
+    except Exception as e:
+        print(f"[VMware] Shutdown error: {e}")
+
+
 def _exit_from_tray(icon, item):
     """Called from tray menu — stop bot and kill the entire process."""
+    _shutdown_vmware_child()
     bot_stop_event.set()
     icon.stop()
     if _gui_root:
@@ -7109,6 +7127,2598 @@ class ConsoleRedirect:
 
 
 # ========================= GUI =========================
+# ========================= VMWARE (BETA) TAB - EMBEDDED SCRIPT (v32.1) =========================
+# The complete standalone VMware script lives below as a plain string. It is
+# NOT imported and NOT executed inside this process: when the VMware tab is
+# opened it is written to NexoVMwareFiles/ and run as a SEPARATE Python
+# process. That keeps it fully isolated from everything in this file (its
+# globals, its ttk.Style, its sys.stdout redirection, its data files), while
+# still shipping as part of this single script.
+#
+# The text between the triple quotes is the original VMware script, byte for
+# byte (line endings normalised to LF). Do not reformat it.
+_VMWARE_SCRIPT_SOURCE = r'''import asyncio
+import traceback
+import signal as _signal_module
+import threading as _threading_module
+
+# pytchat fix: signal.signal() only works on the main thread.
+# Patch it to be a no-op when called from a worker thread.
+_orig_signal = _signal_module.signal
+def _safe_signal(sig, handler):
+    if _threading_module.current_thread() is _threading_module.main_thread():
+        return _orig_signal(sig, handler)
+_signal_module.signal = _safe_signal
+
+import time
+import subprocess
+import os
+import json
+import threading
+import http.server
+import socketserver
+import sys
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+from datetime import datetime
+from collections import defaultdict
+
+# ========================= OPTIONAL DEPENDENCIES =========================
+# These third-party libraries are optional. If any of them are missing,
+# the script will still start, but the features that depend on them
+# will be disabled and a message will explain what to install.
+MISSING_LIBRARIES = []  # list of (import_name, pip_name, description)
+
+try:
+    import pytchat
+    HAS_PYTCHAT = True
+except ImportError:
+    pytchat = None
+    HAS_PYTCHAT = False
+    MISSING_LIBRARIES.append((
+        "pytchat",
+        "pytchat",
+        "Reads YouTube Live Chat messages. Required for the bot to react to chat commands."
+    ))
+
+try:
+    from vncdotool import api as vnc
+    HAS_VNCDOTOOL = True
+except ImportError:
+    vnc = None
+    HAS_VNCDOTOOL = False
+    MISSING_LIBRARIES.append((
+        "vncdotool",
+        "vncdotool",
+        "Connects to the VM over VNC to send keyboard and mouse input. Required for all VM control commands (typing, clicking, moving the mouse, etc)."
+    ))
+
+
+def print_missing_libraries_report():
+    """Prints a clear report of any missing optional libraries and what they do."""
+    if not MISSING_LIBRARIES:
+        print("[Startup] All optional libraries are installed. All features are available.")
+        return
+    print("=" * 70)
+    print("[Startup] Some optional libraries are missing.")
+    print("The script will still run, but related features will be disabled.")
+    print("=" * 70)
+    for import_name, pip_name, description in MISSING_LIBRARIES:
+        print(f"  - Missing: {import_name}")
+        print(f"      Install with: pip install {pip_name}")
+        print(f"      Used for: {description}")
+    print("=" * 70)
+
+# ========================= CUSTOM COMMANDS =========================
+CUSTOM_COMMANDS_FILE = "custom_commands.json"
+custom_commands: dict = {}
+
+def load_custom_commands():
+    global custom_commands
+    try:
+        if os.path.exists(CUSTOM_COMMANDS_FILE):
+            with open(CUSTOM_COMMANDS_FILE, "r", encoding="utf-8") as f:
+                custom_commands = json.load(f)
+            print(f"[CustomCmd] {len(custom_commands)} custom command(s) loaded.")
+    except Exception as e:
+        print(f"[CustomCmd] Load error: {e}")
+        custom_commands = {}
+
+def save_custom_commands():
+    try:
+        with open(CUSTOM_COMMANDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(custom_commands, f, indent=2, ensure_ascii=False)
+        print(f"[CustomCmd] Saved {len(custom_commands)} command(s).")
+    except Exception as e:
+        print(f"[CustomCmd] Save error: {e}")
+
+async def execute_custom_command_async(trigger: str):
+    steps = custom_commands.get(trigger, [])
+    print(f"[CustomCmd] Executing '{trigger}' ({len(steps)} steps)")
+    for step in steps:
+        action   = step.get("action", "").lower().strip()
+        args_str = step.get("args", "").strip()
+        try:
+            if action == "combo":
+                key = "+".join(args_str.replace("+", " ").split())
+                await controller.send_key(key)
+            elif action in ("send", "typeenter", "sendline"):
+                await controller.type_text(args_str)
+                await asyncio.sleep(0.05)
+                await controller.send_key("enter")
+            elif action in ("type", "text", "say"):
+                await controller.type_text(args_str)
+            elif action in ("key", "press"):
+                await controller.send_key(args_str)
+            elif action in ("wait", "pause", "delay"):
+                try:
+                    await asyncio.sleep(min(float(args_str) / 1000.0, 5.0))
+                except ValueError:
+                    await asyncio.sleep(0.5)
+            elif action in ("click", "lclick"):
+                client = await controller.connect_fresh()
+                if client:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, lambda: client.mousePress(1))
+            elif action in ("rclick", "rightclick"):
+                client = await controller.connect_fresh()
+                if client:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, lambda: client.mousePress(3))
+            elif action in ("move", "mv"):
+                parts = args_str.split()
+                if len(parts) >= 2:
+                    client = await controller.connect_fresh()
+                    if client:
+                        dx = int(parts[0]); dy = int(parts[1])
+                        controller.cursor_x = max(0, min(1920, controller.cursor_x + dx))
+                        controller.cursor_y = max(0, min(1080, controller.cursor_y + dy))
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(None,
+                            lambda: client.mouseMove(controller.cursor_x, controller.cursor_y))
+            elif action in ("abs", "moveabs"):
+                parts = args_str.split()
+                if len(parts) >= 2:
+                    client = await controller.connect_fresh()
+                    if client:
+                        controller.cursor_x = max(0, min(1920, int(parts[0])))
+                        controller.cursor_y = max(0, min(1080, int(parts[1])))
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(None,
+                            lambda: client.mouseMove(controller.cursor_x, controller.cursor_y))
+            elif action in ("scroll", "wheel"):
+                try:
+                    delta  = int(args_str)
+                    button = 4 if delta > 0 else 5
+                    client = await controller.connect_fresh()
+                    if client:
+                        loop = asyncio.get_running_loop()
+                        for _ in range(abs(delta)):
+                            await loop.run_in_executor(None, lambda b=button: client.mousePress(b))
+                            await asyncio.sleep(0.01)
+                except ValueError:
+                    pass
+            print(f"[CustomCmd]   -> {action} {args_str}")
+        except Exception as e:
+            print(f"[CustomCmd] Step error ({action} {args_str}): {e}")
+
+# ========================= CONFIG =========================
+VM_DATABASE_FILE = "vms.json"
+vm_list = {}
+VNC_HOST = "localhost"
+VNC_PORT = 5900
+VNC_PASSWORD = "1234"
+YOUTUBE_VIDEO_ID = None
+VMX_PATH = None
+PREFIX = "!"
+def get_vmrun_path():
+    """Looks for vmrun.exe in both the 64-bit and 32-bit Program Files
+    locations, since the install path varies from system to system."""
+    possible_paths = [
+        r"C:\Program Files\VMware\VMware Workstation\vmrun.exe",
+        r"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe",
+        r"D:\Program Files\VMware\VMware Workstation\vmrun.exe",
+        r"D:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe",
+    ]
+    for path in possible_paths:
+        if os.path.exists(path):
+            return path
+    # Fall back to the most common location so error messages still show
+    # a sensible path even when vmrun.exe cannot be found anywhere.
+    return possible_paths[0]
+
+VMRUN_PATH = get_vmrun_path()
+COOLDOWN = {"startvm": 45}
+
+# Single source of truth for vote settings.
+# FIX: Removed the dead VOTE_SETTINGS dict that was never read by any logic.
+VOTE_DURATION   = 100  # Seconds the voting window stays open
+REQUIRED_VOTES  = 2    # Minimum unique voters required to pass
+
+# VM_DATABASE example entries (edit vms.json directly or use registration mode):
+#   "win10": r"D:\VMSVMWARE\w8\Windows 10 x64.vmx"
+#   "win8":  r"D:\VMSVMWARE\w88\Windows 8.x x64.vmx"
+#   "win7":  r"D:\w777\Windows 7 x64.vmx"
+
+active_voters   = defaultdict(lambda: 0)
+votes           = {"restartvm": [], "revert": []}
+last_command_time = {}
+
+# Guard set that prevents the same vote action from being executed twice
+# concurrently (race condition between start_vote and process_command).
+# FIX: Added to resolve the double-execution race condition.
+_executing_votes: set = set()
+
+# ========================= SCANCODE MAP =========================
+# Direct X11 keysym codes to bypass bugs in the vncdotool library.
+SCANCODE_MAP = {
+    "esc": chr(0xff1b), "escape": chr(0xff1b),
+    "tab": chr(0xff09),
+    "enter": chr(0xff0d), "return": chr(0xff0d),
+    "space": " ",
+    "backspace": chr(0xff08),
+    "delete": chr(0xffff), "del": chr(0xffff),
+    "insert": chr(0xff63), "ins": chr(0xff63),
+    "home": chr(0xff50),
+    "end": chr(0xff57),
+    "pageup": chr(0xff55), "pgup": chr(0xff55),
+    "pagedown": chr(0xff56), "pgdn": chr(0xff56),
+    "ctrl": chr(0xffe3), "control": chr(0xffe3),
+    "alt": chr(0xffe9),
+    "shift": chr(0xffe1),
+    "capslock": chr(0xffe5),
+    "win": chr(0xffeb), "super": chr(0xffeb), "windows": chr(0xffeb),
+    "up": chr(0xff52),
+    "down": chr(0xff54),
+    "left": chr(0xff51),
+    "right": chr(0xff53),
+    "f1": chr(0xffbe), "f2": chr(0xffbf), "f3": chr(0xffc0), "f4": chr(0xffc1),
+    "f5": chr(0xffc2), "f6": chr(0xffc3), "f7": chr(0xffc4), "f8": chr(0xffc5),
+    "f9": chr(0xffc6), "f10": chr(0xffc7), "f11": chr(0xffc8), "f12": chr(0xffc9),
+}
+
+# ========================= OVERLAY SYSTEM =========================
+overlay_data    = {"chat": [], "running_command": ""}
+seen_message_ids = set()
+last_write_time = 0
+_overlay_lock   = threading.Lock()
+
+
+def update_overlay(author=None, message=None, running=None, msg_id=None):
+    global last_write_time
+    current_time = time.time()
+
+    with _overlay_lock:
+        changed = False
+
+        if running is not None and overlay_data.get("running_command") != running:
+            overlay_data["running_command"] = running
+            changed = True
+
+        if author and message and msg_id and msg_id not in seen_message_ids:
+            seen_message_ids.add(msg_id)
+            overlay_data["chat"].append({
+                "author":  str(author),
+                "message": str(message),
+                "id":      str(msg_id),
+            })
+
+            if len(overlay_data["chat"]) > 20:
+                removed = overlay_data["chat"].pop(0)
+                seen_message_ids.discard(removed.get("id"))
+
+            changed = True
+
+        if changed and (current_time - last_write_time > 0.15):
+            try:
+                with open("overlay.json", "w", encoding="utf-8") as f:
+                    json.dump(overlay_data, f, ensure_ascii=False, separators=(",", ":"))
+                last_write_time = current_time
+            except Exception as e:
+                print(f"[Overlay Error] {e}")
+
+
+async def show_running_command(cmd_text: str):
+    update_overlay(running=cmd_text)
+    await asyncio.sleep(2)
+    if overlay_data["running_command"] == cmd_text:
+        update_overlay(running="")
+
+
+def start_overlay_server():
+    PORT = 8080
+
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass  # Suppress request logs
+
+    try:
+        with socketserver.TCPServer(("", PORT), QuietHandler) as httpd:
+            print(f"Overlay server running at: http://localhost:{PORT}/chat.html")
+            httpd.serve_forever()
+    except OSError:
+        print("Port 8080 is busy. Overlay server could not start.")
+
+
+# ========================= SPEAKER =========================
+def speak_text(text: str):
+    print(f"\n[SPEAKER]: {text}\n")
+
+
+# ========================= VM CONTROLLER =========================
+class VMController:
+    def __init__(self):
+        self.client   = None
+        self.cursor_x = 512
+        self.cursor_y = 384
+        # Prevents concurrent VNC operations (avoids stuck keys).
+        self._lock        = asyncio.Lock()
+        # Emergency signal that tells an active hold loop to stop early.
+        self._abort_hold  = False
+
+    async def connect_fresh(self):
+        await self._disconnect()
+        if not HAS_VNCDOTOOL:
+            print("VNC connect failed: vncdotool is not installed.")
+            self.client = None
+            return None
+        try:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] New VNC connection...")
+            loop = asyncio.get_running_loop()
+            self.client = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: vnc.connect(f"{VNC_HOST}::{VNC_PORT}", password=str(VNC_PASSWORD)),
+                ),
+                timeout=8,
+            )
+            # Always clear any stuck modifier keys on every fresh connection.
+            # Root cause of the "keyboard locks up" bug: if a previous keyDown
+            # (from !hold, !combo, or type_text) was never followed by a successful
+            # keyUp (due to a timeout / exception / dropped connection), the VNC
+            # server keeps that key marked as "pressed" at the OS level.  Because
+            # VNC keyboard events are injected as real OS input, even physical
+            # keystrokes on the VMware window are then interpreted with that phantom
+            # modifier held — making all input appear broken.  Sending keyUp for
+            # every modifier on each new connection guarantees a clean slate before
+            # every operation.
+            await self._clear_stuck_modifiers(self.client)
+            print("Fresh VNC connected.")
+            return self.client
+        except Exception as e:
+            print(f"VNC connect failed: {e}")
+            self.client = None
+            return None
+
+    async def _clear_stuck_modifiers(self, client):
+        """Send keyUp for every modifier key to clear any stuck VNC keyboard state."""
+        loop = asyncio.get_running_loop()
+        modifier_names = [
+            "shift", "ctrl", "alt", "win", "capslock",
+        ]
+        released: set = set()
+        for name in modifier_names:
+            mapped = SCANCODE_MAP.get(name)
+            if mapped and mapped not in released:
+                released.add(mapped)
+                try:
+                    await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda mk=mapped: client.keyUp(mk)),
+                        timeout=0.5,
+                    )
+                except Exception:
+                    pass
+
+    async def _disconnect(self):
+        if self.client:
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
+        self.client = None
+
+    async def send_key(self, key: str):
+        # Lock the entire operation so no other command can call connect_fresh()
+        # mid-execution and disconnect the client (which was causing stuck keys).
+        async with self._lock:
+            client = await self.connect_fresh()
+            if not client:
+                return False
+            try:
+                loop      = asyncio.get_running_loop()
+                clean_key = key.strip().lower()
+                mapped_key = SCANCODE_MAP.get(clean_key, clean_key)
+
+                if "+" in clean_key:
+                    # Combo keys, e.g. ctrl+c, win+r
+                    keys       = clean_key.split("+")
+                    mapped_keys = [
+                        SCANCODE_MAP.get(k.strip(), k.strip()) for k in keys
+                    ]
+                    try:
+                        for k in mapped_keys:
+                            await asyncio.wait_for(
+                                loop.run_in_executor(None, lambda k2=k: client.keyDown(k2)),
+                                timeout=2.0,
+                            )
+                            await asyncio.sleep(0.01)
+                    finally:
+                        # Always release all keys, even if keyDown raised an error midway.
+                        for k in reversed(mapped_keys):
+                            try:
+                                await asyncio.wait_for(
+                                    loop.run_in_executor(None, lambda k2=k: client.keyUp(k2)),
+                                    timeout=2.0,
+                                )
+                            except Exception:
+                                pass
+                    print(f"Combo sent: {'+'.join(mapped_keys)}")
+
+                else:
+                    # Single key: press and release atomically in the same thread.
+                    def do_safe_press():
+                        try:
+                            client.keyDown(mapped_key)
+                            time.sleep(0.1)
+                        finally:
+                            client.keyUp(mapped_key)
+
+                    await asyncio.wait_for(
+                        loop.run_in_executor(None, do_safe_press), timeout=10.0
+                    )
+                    print(f"Key sent and released: {mapped_key}")
+
+                return True
+
+            except Exception as e:
+                print(f"Key send error: {e}")
+                traceback.print_exc()
+                # FIX: Was missing 'return False' here; the function returned None on error.
+                return False
+
+    async def type_text(self, text: str):
+        # Same lock as send_key — prevents connection being torn down mid-typing.
+        async with self._lock:
+            client = await self.connect_fresh()
+            if not client:
+                return False
+            try:
+                loop = asyncio.get_running_loop()
+                for char in text:
+                    if char.isupper() or char in '!@#$%^&*()_+{}|:"<>?~':
+                        # Hold Shift for uppercase / special characters.
+                        try:
+                            await asyncio.wait_for(
+                                loop.run_in_executor(
+                                    None, lambda: client.keyDown(SCANCODE_MAP["shift"])
+                                ),
+                                timeout=2.0,
+                            )
+                            key_to_send = char.lower() if char.isupper() else char
+                            await asyncio.wait_for(
+                                loop.run_in_executor(
+                                    None, lambda k=key_to_send: client.keyPress(k)
+                                ),
+                                timeout=2.0,
+                            )
+                        finally:
+                            try:
+                                await asyncio.wait_for(
+                                    loop.run_in_executor(
+                                        None, lambda: client.keyUp(SCANCODE_MAP["shift"])
+                                    ),
+                                    timeout=2.0,
+                                )
+                            except Exception:
+                                pass
+                    else:
+                        await asyncio.wait_for(
+                            loop.run_in_executor(None, lambda c=char: client.keyPress(c)),
+                            timeout=2.0,
+                        )
+                    await asyncio.sleep(0.007)
+
+                print(f"Text sent: {text}")
+                return True
+
+            except Exception:
+                # Clear all modifier keys, not just Shift, in case another
+                # modifier was involved (e.g. a future code path adds Ctrl typing).
+                await self._clear_stuck_modifiers(client)
+                await self._disconnect()
+                return False
+
+
+controller = VMController()
+
+
+# ========================= VOTE HELPERS =========================
+def update_vote_json(restart_time: int = 0, revert_time: int = 0):
+    data = {
+        "restartvm": {
+            "current":        len(votes["restartvm"]),
+            "required":       REQUIRED_VOTES,
+            "remaining_time": restart_time,
+        },
+        "revert": {
+            "current":        len(votes["revert"]),
+            "required":       REQUIRED_VOTES,
+            "remaining_time": revert_time,
+        },
+    }
+    try:
+        with open("votes.json", "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+async def execute_vm_action(vote_type: str):
+    # FIX: Guard against double execution. If start_vote and process_command both
+    # trigger this for the same vote_type at the same time, only the first one runs.
+    if vote_type in _executing_votes:
+        return
+    _executing_votes.add(vote_type)
+    try:
+        votes[vote_type] = []
+        update_vote_json()
+
+        if vote_type == "restartvm":
+            await run_vmrun(["-T", "ws", "reset", VMX_PATH, "hard"])
+        elif vote_type == "revert":
+            await run_vmrun(["-T", "ws", "revertToSnapshot", VMX_PATH, "snp"])
+            await asyncio.sleep(5)
+            await run_vmrun(["-T", "ws", "start", VMX_PATH, "gui"])
+    finally:
+        _executing_votes.discard(vote_type)
+
+
+async def start_vote(vote_type: str, starter: str):
+    votes[vote_type] = [starter]
+    print(f"Vote started for !{vote_type} by {starter}")
+
+    if vote_type == "restartvm":
+        update_vote_json(restart_time=VOTE_DURATION)
+    else:
+        update_vote_json(revert_time=VOTE_DURATION)
+
+    for remaining in range(VOTE_DURATION, 0, -1):
+        await asyncio.sleep(1)
+        if vote_type == "restartvm":
+            update_vote_json(restart_time=remaining)
+        else:
+            update_vote_json(revert_time=remaining)
+
+        if len(votes[vote_type]) >= REQUIRED_VOTES:
+            print(f"Vote PASSED early for !{vote_type}")
+            await execute_vm_action(vote_type)
+            return
+
+    votes[vote_type] = []
+    update_vote_json()
+    print(f"Vote for !{vote_type} expired without reaching required votes.")
+
+
+# ========================= STDOUT REDIRECT =========================
+class ConsoleRedirect:
+    """Redirects stdout/stderr to a Tkinter ScrolledText widget."""
+    def __init__(self, widget):
+        self.widget        = widget
+        self._orig_stdout  = sys.stdout
+        self._orig_stderr  = sys.stderr
+        self._pending      = ""   # Buffer to accumulate incomplete lines.
+
+    def write(self, msg):
+        self._orig_stdout.write(msg)
+        try:
+            self._pending += msg
+            # Only flush complete lines so each timestamp appears once per line.
+            while "\n" in self._pending:
+                line, self._pending = self._pending.split("\n", 1)
+                ts = time.strftime("%H:%M:%S")
+                self.widget.configure(state='normal')
+                self.widget.insert('end', f"[{ts}] {line}\n")
+                self.widget.see('end')
+                self.widget.configure(state='disabled')
+        except Exception:
+            pass
+
+    def flush(self): pass
+
+    def start(self):
+        sys.stdout = self
+        sys.stderr = self
+
+    def stop(self):
+        sys.stdout = self._orig_stdout
+        sys.stderr = self._orig_stderr
+
+
+# ========================= BOT MAIN =========================
+# Reference to the running asyncio event loop (set when bot starts).
+_bot_loop: asyncio.AbstractEventLoop | None = None
+
+async def bot_main():
+    update_overlay()
+    threading.Thread(target=start_overlay_server, daemon=True).start()
+    print("Bot starting...\n")
+    await asyncio.gather(youtube_loop())
+
+
+def _load_vm_list() -> dict:
+    """Load VM aliases from vms.json. Returns {} if file missing."""
+    if os.path.exists(VM_DATABASE_FILE):
+        try:
+            with open(VM_DATABASE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_vm_list(data: dict):
+    with open(VM_DATABASE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+# ========================= GUI =========================
+class NexovativeControlCenterGUI:
+    BG      = "#0f0f1a"
+    BG2     = "#16162a"
+    BG3     = "#1e1e35"
+    ACCENT  = "#7c5cbf"
+    ACCENT2 = "#a07cdf"
+    GREEN   = "#3ddc97"
+    RED     = "#e05c7a"
+    YELLOW  = "#f0c060"
+    TEXT    = "#e8e8f0"
+    TEXTDIM = "#8888aa"
+    CONSOLE = "#0a0a14"
+    CONTEXT = "#00e676"
+    BORDER  = "#2d2d50"
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("VMware Control Center")
+        self.root.geometry("900x700")
+        self.root.minsize(760, 580)
+        self.root.configure(bg=self.BG)
+        self.root.resizable(True, True)
+
+        self._bot_thread     = None
+        self._bot_running    = False
+        self._console_redir  = None
+        self._editing_cmd    = None
+        self._step_items     = []
+
+        self._build_styles()
+        self._build_ui()
+        load_custom_commands()
+        self._refresh_cmd_list()
+        self._report_missing_libraries()
+
+    def _report_missing_libraries(self):
+        if not MISSING_LIBRARIES:
+            self._log("[Startup] All optional libraries are installed. All features are available.")
+            return
+        self._log(f"[Startup] {len(MISSING_LIBRARIES)} optional library(ies) missing. Related features are disabled:")
+        for import_name, pip_name, description in MISSING_LIBRARIES:
+            self._log(f"  - {import_name} (pip install {pip_name}) → {description}")
+
+    # ── Styles ──
+    def _build_styles(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure(".",
+            background=self.BG, foreground=self.TEXT,
+            fieldbackground=self.BG2, bordercolor=self.BORDER,
+            troughcolor=self.BG2, selectbackground=self.ACCENT,
+            selectforeground=self.TEXT, font=("Segoe UI", 10))
+        s.configure("TNotebook", background=self.BG, tabmargins=[2,4,0,0])
+        s.configure("TNotebook.Tab",
+            background=self.BG2, foreground=self.TEXTDIM,
+            padding=[16,6], font=("Segoe UI",10,"bold"))
+        s.map("TNotebook.Tab",
+            background=[("selected", self.BG3)],
+            foreground=[("selected", self.TEXT)])
+        s.configure("TFrame", background=self.BG)
+        s.configure("Card.TFrame", background=self.BG2)
+        s.configure("TLabel",  background=self.BG,  foreground=self.TEXT)
+        s.configure("TEntry",
+            fieldbackground=self.BG3, foreground=self.TEXT,
+            insertcolor=self.TEXT, bordercolor=self.BORDER, relief="flat")
+        s.configure("TCombobox",
+            fieldbackground=self.BG3, foreground=self.TEXT,
+            selectbackground=self.ACCENT, arrowcolor=self.ACCENT2)
+        s.map("TCombobox", fieldbackground=[("readonly", self.BG3)])
+        for name, bg, fg in [
+            ("Green.TButton",  self.GREEN,  "#000"),
+            ("Red.TButton",    self.RED,    "#fff"),
+            ("Accent.TButton", self.ACCENT, "#fff"),
+            ("Dim.TButton",    self.BG3,    self.TEXT),
+        ]:
+            s.configure(name, background=bg, foreground=fg,
+                        font=("Segoe UI",10,"bold"), relief="flat", padding=[10,5])
+            s.map(name, background=[("active", self.ACCENT2)])
+        s.configure("TScrollbar",
+            background=self.BG3, troughcolor=self.BG,
+            arrowcolor=self.ACCENT2, bordercolor=self.BG)
+
+    # ── Root UI ──
+    def _build_ui(self):
+        bar = tk.Frame(self.root, bg=self.BG2, height=48)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        tk.Label(bar, text="VMware Control Center",
+                 bg=self.BG2, fg=self.TEXT,
+                 font=("Segoe UI",13,"bold")).pack(side="left", padx=16, pady=8)
+        self._status_dot = tk.Label(bar, text="  Stopped",
+                                    bg=self.BG2, fg=self.RED,
+                                    font=("Segoe UI",10,"bold"))
+        self._status_dot.pack(side="right", padx=16)
+
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        t1 = ttk.Frame(nb); t2 = ttk.Frame(nb); t3 = ttk.Frame(nb)
+        nb.add(t1, text="  Main  ")
+        nb.add(t2, text="  Command Builder  ")
+        nb.add(t3, text="  VM Controls  ")
+
+        self._build_main_tab(t1)
+        self._build_cmd_builder_tab(t2)
+        self._build_vm_controls_tab(t3)
+
+    # ──────────────── TAB 1: MAIN ────────────────
+    def _build_main_tab(self, parent):
+        card = ttk.Frame(parent, style="Card.TFrame", padding=16)
+        card.pack(fill="x", padx=12, pady=(12,6))
+
+        # YouTube ID
+        tk.Label(card, text="YouTube Video ID", bg=self.BG2,
+                 fg=self.TEXTDIM, font=("Segoe UI",9,"bold")).grid(
+                 row=0, column=0, sticky="w", padx=(0,8))
+        self._yt_var = tk.StringVar()
+        ttk.Entry(card, textvariable=self._yt_var, width=34,
+                  font=("Segoe UI Mono",10)).grid(
+                  row=0, column=1, sticky="ew", padx=(0,12), ipady=4)
+
+        # VM selection
+        tk.Label(card, text="VMware VM", bg=self.BG2,
+                 fg=self.TEXTDIM, font=("Segoe UI",9,"bold")).grid(
+                 row=1, column=0, sticky="w", padx=(0,8), pady=(10,0))
+        self._vm_var = tk.StringVar()
+        self._vm_combo = ttk.Combobox(card, textvariable=self._vm_var,
+                                      state="readonly", width=32,
+                                      font=("Segoe UI",10))
+        self._vm_combo.grid(row=1, column=1, sticky="ew",
+                            padx=(0,12), pady=(10,0), ipady=3)
+        ttk.Button(card, text="Refresh", style="Dim.TButton",
+                   command=self._refresh_vm_list).grid(
+                   row=1, column=2, pady=(10,0))
+
+        # Add VM row
+        tk.Label(card, text="Add VM", bg=self.BG2,
+                 fg=self.TEXTDIM, font=("Segoe UI",9,"bold")).grid(
+                 row=2, column=0, sticky="w", padx=(0,8), pady=(10,0))
+        add_inner = tk.Frame(card, bg=self.BG2)
+        add_inner.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(10,0))
+        self._alias_var = tk.StringVar()
+        self._vmx_var   = tk.StringVar()
+        ttk.Entry(add_inner, textvariable=self._alias_var,
+                  width=10, font=("Segoe UI Mono",10)).pack(side="left", padx=(0,6), ipady=3)
+        tk.Label(add_inner, text="alias", bg=self.BG2, fg=self.TEXTDIM,
+                 font=("Segoe UI",8)).pack(side="left", padx=(0,10))
+        ttk.Entry(add_inner, textvariable=self._vmx_var,
+                  width=26, font=("Segoe UI Mono",10)).pack(side="left", padx=(0,6), ipady=3)
+        tk.Label(add_inner, text=".vmx path", bg=self.BG2, fg=self.TEXTDIM,
+                 font=("Segoe UI",8)).pack(side="left", padx=(0,10))
+        ttk.Button(add_inner, text="+ Add", style="Dim.TButton",
+                   command=self._add_vm).pack(side="left")
+
+        card.columnconfigure(1, weight=1)
+
+        # Buttons
+        btn_f = tk.Frame(parent, bg=self.BG)
+        btn_f.pack(fill="x", padx=12, pady=6)
+        ttk.Button(btn_f, text="Start Bot", style="Green.TButton",
+                   command=self._start_bot).pack(side="left", padx=(0,8))
+        ttk.Button(btn_f, text="Stop Bot", style="Red.TButton",
+                   command=self._stop_bot).pack(side="left")
+
+        tk.Label(parent, text="Console Output", bg=self.BG, fg=self.TEXTDIM,
+                 font=("Segoe UI",9,"bold")).pack(anchor="w", padx=16, pady=(4,0))
+
+        cf = tk.Frame(parent, bg=self.BORDER, bd=1)
+        cf.pack(fill="both", expand=True, padx=12, pady=(2,6))
+        self._console = scrolledtext.ScrolledText(
+            cf, bg=self.CONSOLE, fg=self.CONTEXT,
+            font=("Consolas",9), insertbackground=self.CONTEXT,
+            selectbackground=self.ACCENT, relief="flat", bd=0,
+            state='disabled', wrap='word')
+        self._console.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # Admin CMD
+        af = tk.Frame(parent, bg=self.BG2, pady=6)
+        af.pack(fill="x", padx=12, pady=(0,8))
+        tk.Label(af, text="Admin CMD:", bg=self.BG2, fg=self.TEXTDIM,
+                 font=("Segoe UI",9,"bold")).pack(side="left", padx=(8,6))
+        self._admin_var = tk.StringVar()
+        ae = ttk.Entry(af, textvariable=self._admin_var,
+                       width=36, font=("Segoe UI Mono",10))
+        ae.pack(side="left", padx=(0,8), ipady=4)
+        ae.bind("<Return>", lambda e: self._send_admin_cmd())
+        ttk.Button(af, text="Send", style="Accent.TButton",
+                   command=self._send_admin_cmd).pack(side="left")
+
+        self._refresh_vm_list()
+
+    # ──────────────── TAB 2: COMMAND BUILDER ────────────────
+    def _build_cmd_builder_tab(self, parent):
+        pane = tk.PanedWindow(parent, orient="horizontal",
+                              bg=self.BG, sashwidth=6, bd=0)
+        pane.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # Left: list
+        left = ttk.Frame(pane, style="Card.TFrame", padding=8)
+        pane.add(left, minsize=180, width=220)
+        tk.Label(left, text="Custom Commands", bg=self.BG2, fg=self.ACCENT2,
+                 font=("Segoe UI",10,"bold")).pack(anchor="w", pady=(0,6))
+        lf = tk.Frame(left, bg=self.BG3, highlightbackground=self.BORDER,
+                      highlightthickness=1)
+        lf.pack(fill="both", expand=True)
+        self._cmd_listbox = tk.Listbox(lf, bg=self.BG3, fg=self.TEXT,
+            selectbackground=self.ACCENT, selectforeground="#fff",
+            activestyle="none", font=("Segoe UI Mono",10),
+            relief="flat", bd=0, exportselection=False)
+        self._cmd_listbox.pack(fill="both", expand=True)
+        self._cmd_listbox.bind("<<ListboxSelect>>", self._on_cmd_select)
+        br = tk.Frame(left, bg=self.BG2)
+        br.pack(fill="x", pady=(6,0))
+        ttk.Button(br, text="+ New", style="Green.TButton",
+                   command=self._new_cmd).pack(side="left", expand=True, fill="x", padx=(0,4))
+        ttk.Button(br, text="Del", style="Red.TButton",
+                   command=self._delete_cmd).pack(side="left", expand=True, fill="x")
+
+        # Right: editor
+        right = ttk.Frame(pane, style="Card.TFrame", padding=10)
+        pane.add(right, minsize=300)
+
+        tr = tk.Frame(right, bg=self.BG2)
+        tr.pack(fill="x", pady=(0,10))
+        tk.Label(tr, text="Trigger:", bg=self.BG2, fg=self.TEXTDIM,
+                 font=("Segoe UI",9,"bold")).pack(side="left", padx=(0,8))
+        self._trig_var = tk.StringVar()
+        ttk.Entry(tr, textvariable=self._trig_var,
+                  font=("Segoe UI Mono",11), width=18).pack(side="left", ipady=4)
+        tk.Label(tr, text="(e.g. !bubbles)", bg=self.BG2, fg=self.TEXTDIM,
+                 font=("Segoe UI",9)).pack(side="left", padx=8)
+
+        # Chain input
+        cc = tk.Frame(right, bg=self.BG3, pady=8, padx=10)
+        cc.pack(fill="x", pady=(0,10))
+        hr = tk.Frame(cc, bg=self.BG3)
+        hr.pack(fill="x", pady=(0,4))
+        tk.Label(hr, text="Quick Chain Input", bg=self.BG3, fg=self.ACCENT2,
+                 font=("Segoe UI",9,"bold")).pack(side="left")
+        tk.Label(hr, text="  Write in chat syntax -> parse into steps",
+                 bg=self.BG3, fg=self.TEXTDIM, font=("Segoe UI",8)).pack(side="left")
+        cer = tk.Frame(cc, bg=self.BG3)
+        cer.pack(fill="x")
+        self._chain_var = tk.StringVar()
+        ce = ttk.Entry(cer, textvariable=self._chain_var, font=("Segoe UI Mono",10))
+        ce.pack(side="left", fill="x", expand=True, ipady=5, padx=(0,8))
+        ce.bind("<Return>", lambda e: self._parse_chain_input())
+        ttk.Button(cer, text="Parse Steps", style="Accent.TButton",
+                   command=self._parse_chain_input).pack(side="left")
+        tk.Label(cc,
+                 text="Example:  !combo win+r  !wait 800  !typeenter notepad.exe  !wait 500  !type Hello World",
+                 bg=self.BG3, fg=self.TEXTDIM, font=("Segoe UI",8),
+                 wraplength=440, justify="left").pack(anchor="w", pady=(4,0))
+
+        # Steps treeview
+        sh = tk.Frame(right, bg=self.BG2)
+        sh.pack(fill="x", pady=(0,4))
+        tk.Label(sh, text="Steps", bg=self.BG2, fg=self.ACCENT2,
+                 font=("Segoe UI",10,"bold")).pack(side="left")
+        tk.Label(sh, text="  (Fill via Parse or add manually below)",
+                 bg=self.BG2, fg=self.TEXTDIM, font=("Segoe UI",8)).pack(side="left")
+
+        tf = tk.Frame(right, bg=self.BORDER, bd=1)
+        tf.pack(fill="both", expand=True, pady=(0,6))
+        self._step_tree = ttk.Treeview(tf, columns=("action","args"),
+                                       show="headings", height=8, selectmode="browse")
+        self._step_tree.heading("action", text="Action")
+        self._step_tree.heading("args",   text="Arguments")
+        self._step_tree.column("action", width=120, minwidth=90)
+        self._step_tree.column("args",   width=240, minwidth=120)
+        self._step_tree.pack(fill="both", expand=True, side="left")
+        ts = ttk.Scrollbar(tf, orient="vertical", command=self._step_tree.yview)
+        ts.pack(side="right", fill="y")
+        self._step_tree.configure(yscrollcommand=ts.set)
+
+        sbr = tk.Frame(right, bg=self.BG2)
+        sbr.pack(fill="x", pady=(0,8))
+        for lbl, fn in [("Up","_step_up"),("Down","_step_down"),("Remove","_step_remove")]:
+            ttk.Button(sbr, text=lbl, style="Dim.TButton",
+                       command=lambda f=fn: getattr(self,f)()).pack(side="left", padx=(0,4))
+
+        ACTIONS = ["combo","type","typeenter","key","wait",
+                   "click","rclick","move","abs","scroll"]
+        addf = tk.Frame(right, bg=self.BG3, pady=8, padx=8)
+        addf.pack(fill="x", pady=(0,8))
+        tk.Label(addf, text="Add Step:", bg=self.BG3, fg=self.TEXTDIM,
+                 font=("Segoe UI",9,"bold")).pack(side="left", padx=(0,8))
+        self._action_var = tk.StringVar(value="combo")
+        ttk.Combobox(addf, textvariable=self._action_var, values=ACTIONS,
+                     state="readonly", width=12).pack(side="left", padx=(0,8), ipady=3)
+        tk.Label(addf, text="Args:", bg=self.BG3, fg=self.TEXTDIM,
+                 font=("Segoe UI",9)).pack(side="left", padx=(0,4))
+        self._args_var = tk.StringVar()
+        ttk.Entry(addf, textvariable=self._args_var, width=20,
+                  font=("Segoe UI Mono",10)).pack(side="left", padx=(0,8), ipady=3)
+        ttk.Button(addf, text="+ Add Step", style="Accent.TButton",
+                   command=self._add_step).pack(side="left")
+
+        tk.Label(right,
+                 text="combo: win+r  |  type: notepad  |  typeenter: run.exe  |  wait: 500 (ms)  |  key: enter",
+                 bg=self.BG2, fg=self.TEXTDIM, font=("Segoe UI",8),
+                 wraplength=420, justify="left").pack(anchor="w", pady=(0,6))
+
+        savr = tk.Frame(right, bg=self.BG2)
+        savr.pack(fill="x")
+        ttk.Button(savr, text="Save Command", style="Green.TButton",
+                   command=self._save_cmd).pack(side="left", padx=(0,8))
+        ttk.Button(savr, text="Test Now", style="Accent.TButton",
+                   command=self._test_cmd).pack(side="left")
+
+    # ──────────────── TAB 3: VM CONTROLS ────────────────
+    def _build_vm_controls_tab(self, parent):
+        tk.Label(parent, text="Virtual Machine Controls",
+                 bg=self.BG, fg=self.ACCENT2,
+                 font=("Segoe UI",13,"bold")).pack(pady=(24,4))
+        tk.Label(parent, text="Direct admin actions — no vote required.",
+                 bg=self.BG, fg=self.TEXTDIM,
+                 font=("Segoe UI",9)).pack(pady=(0,28))
+
+        grid = ttk.Frame(parent, style="Card.TFrame", padding=28)
+        grid.pack(padx=60, fill="x")
+
+        btn_cfg = [
+            ("Start VM",    "green",  "Power on the virtual machine.",            self._vm_start),
+            ("Restart VM",  "accent", "Send a hard reset to the VM.",             self._vm_restart),
+            ("Revert VM",   "accent", "Revert to snapshot and reboot.",           self._vm_revert),
+            ("Shutdown VM", "red",    "Force stop the virtual machine.",          self._vm_shutdown),
+        ]
+        style_map = {"green":"Green.TButton","accent":"Accent.TButton","red":"Red.TButton"}
+
+        for i, (label, color, desc, cmd) in enumerate(btn_cfg):
+            row = i // 2; col = i % 2
+            cell = tk.Frame(grid, bg=self.BG2, padx=16, pady=16)
+            cell.grid(row=row, column=col, padx=12, pady=12, sticky="nsew")
+            grid.columnconfigure(col, weight=1)
+            ttk.Button(cell, text=label, style=style_map[color],
+                       command=cmd, width=18).pack()
+            tk.Label(cell, text=desc, bg=self.BG2, fg=self.TEXTDIM,
+                     font=("Segoe UI",8), wraplength=180, justify="center").pack(pady=(6,0))
+
+        sf = tk.Frame(parent, bg=self.BG)
+        sf.pack(pady=24)
+        tk.Label(sf, text="Last action:", bg=self.BG, fg=self.TEXTDIM,
+                 font=("Segoe UI",9)).pack(side="left", padx=(0,8))
+        self._vm_action_label = tk.Label(sf, text="—", bg=self.BG,
+                                          fg=self.TEXT, font=("Segoe UI",9,"bold"))
+        self._vm_action_label.pack(side="left")
+
+    def _vm_set_last(self, text, color=None):
+        self._vm_action_label.configure(text=text, fg=color or self.TEXT)
+
+    def _run_vm_action(self, coro, label_start, label_ok, label_err_prefix):
+        self._vm_set_last(label_start, self.YELLOW)
+        def run():
+            try:
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(coro)
+                loop.close()
+                self.root.after(0, lambda: self._vm_set_last(label_ok, self.GREEN))
+            except Exception as e:
+                self.root.after(0, lambda: self._vm_set_last(f"{label_err_prefix}: {e}", self.RED))
+                print(f"[VM] Error: {e}")
+        threading.Thread(target=run, daemon=True).start()
+
+    def _check_vmx(self) -> bool:
+        if not VMX_PATH:
+            messagebox.showerror("No VM", "Start the bot first to select a VM.")
+            return False
+        return True
+
+    def _vm_start(self):
+        if not self._check_vmx(): return
+        self._log("[VM] Start requested.")
+        async def _start():
+            await run_vmrun(["-T","ws","start",VMX_PATH,"gui"])
+        self._run_vm_action(_start(), "Starting...", "Started", "Start error")
+
+    def _vm_restart(self):
+        if not self._check_vmx(): return
+        if not messagebox.askyesno("Restart VM", f"Hard reset the VM now?"): return
+        self._log("[VM] Restart requested.")
+        async def _restart():
+            await run_vmrun(["-T","ws","reset",VMX_PATH,"hard"])
+        self._run_vm_action(_restart(), "Restarting...", "Restarted", "Restart error")
+
+    def _vm_revert(self):
+        if not self._check_vmx(): return
+        if not messagebox.askyesno("Revert VM",
+                "Revert to snapshot 'snp' and reboot?\nAll unsaved VM state will be lost."): return
+        self._log("[VM] Revert requested.")
+        async def _revert():
+            await run_vmrun(["-T","ws","revertToSnapshot",VMX_PATH,"snp"])
+            await asyncio.sleep(5)
+            await run_vmrun(["-T","ws","start",VMX_PATH,"gui"])
+        self._run_vm_action(_revert(), "Reverting...", "Reverted", "Revert error")
+
+    def _vm_shutdown(self):
+        if not self._check_vmx(): return
+        if not messagebox.askyesno("Shutdown VM",
+                "Force stop the VM?\nUnsaved VM state will be lost."): return
+        self._log("[VM] Shutdown requested.")
+        async def _shutdown():
+            await run_vmrun(["-T","ws","stop",VMX_PATH,"hard"])
+        self._run_vm_action(_shutdown(), "Shutting down...", "Powered off", "Shutdown error")
+
+    # ──────────────── VM List ────────────────
+    def _refresh_vm_list(self):
+        vms = _load_vm_list()
+        aliases = list(vms.keys())
+        self._vm_combo['values'] = aliases
+        if aliases:
+            self._vm_combo.current(0)
+            self._log(f"VM list loaded: {', '.join(aliases)}")
+        else:
+            self._log("No VMs registered. Add one with alias + .vmx path above.")
+
+    def _add_vm(self):
+        alias = self._alias_var.get().strip().lower()
+        vmx   = self._vmx_var.get().strip().replace('"','')
+        if not alias or not vmx:
+            messagebox.showwarning("Missing", "Enter both an alias and a .vmx path.")
+            return
+        vms = _load_vm_list()
+        vms[alias] = vmx
+        _save_vm_list(vms)
+        self._alias_var.set(""); self._vmx_var.set("")
+        self._refresh_vm_list()
+        self._log(f"[VM] Added: {alias} -> {vmx}")
+
+    # ──────────────── Bot Start / Stop ────────────────
+    def _start_bot(self):
+        global YOUTUBE_VIDEO_ID, VMX_PATH, vm_list, _bot_loop
+        yt  = self._yt_var.get().strip()
+        alias = self._vm_var.get().strip()
+        if not yt:
+            messagebox.showerror("Missing", "Enter a YouTube Video ID.")
+            return
+        if not alias:
+            messagebox.showerror("Missing", "Select a VM.")
+            return
+        if self._bot_running:
+            self._log("Bot is already running."); return
+
+        vm_list = _load_vm_list()
+        if alias not in vm_list:
+            messagebox.showerror("Unknown VM", f"'{alias}' not found in vms.json.")
+            return
+
+        YOUTUBE_VIDEO_ID = yt
+        VMX_PATH         = vm_list[alias]
+        self._bot_running = True
+        self._set_status("Running", self.GREEN)
+        self._console_redir = ConsoleRedirect(self._console)
+        self._console_redir.start()
+        self._log(f"Starting bot -> YT: {YOUTUBE_VIDEO_ID}  |  VM: {alias} ({VMX_PATH})")
+
+        def run():
+            global _bot_loop
+            try:
+                _bot_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(_bot_loop)
+                _bot_loop.run_until_complete(bot_main())
+            except Exception as e:
+                print(f"[Bot] Fatal error: {e}")
+            finally:
+                _bot_loop = None
+                self._bot_running = False
+                self.root.after(0, lambda: self._set_status("Stopped", self.RED))
+
+        self._bot_thread = threading.Thread(target=run, daemon=True)
+        self._bot_thread.start()
+
+    def _stop_bot(self):
+        self._bot_running = False
+        loop = _bot_loop
+        if loop and loop.is_running():
+            # Cancel all running tasks in the bot event loop so youtube_loop exits.
+            loop.call_soon_threadsafe(
+                lambda: [t.cancel() for t in asyncio.all_tasks(loop)]
+            )
+        if self._console_redir:
+            self._console_redir.stop()
+            self._console_redir = None
+        self._set_status("Stopped", self.RED)
+        self._log("Bot stopped by user.")
+
+    # ──────────────── Admin CMD ────────────────
+    def _send_admin_cmd(self):
+        cmd = self._admin_var.get().strip()
+        if not cmd: return
+        self._admin_var.set("")
+        self._log(f"[AdminCMD] {cmd}")
+
+        async def _run():
+            c = cmd.lower()
+            if c == "!startvm":
+                await run_vmrun(["-T","ws","start",VMX_PATH,"gui"])
+            elif c == "!restart":
+                await run_vmrun(["-T","ws","reset",VMX_PATH,"hard"])
+            elif c == "!revert":
+                await run_vmrun(["-T","ws","revertToSnapshot",VMX_PATH,"snp"])
+                await asyncio.sleep(5)
+                await run_vmrun(["-T","ws","start",VMX_PATH,"gui"])
+            elif c == "!shutdown":
+                await run_vmrun(["-T","ws","stop",VMX_PATH,"hard"])
+            elif c == "!clearvotes":
+                votes["restartvm"] = []
+                votes["revert"]    = []
+                update_vote_json()
+                print("[Admin] Votes cleared.")
+            elif cmd.lower().startswith("!speak "):
+                speak_text(cmd[7:].strip())
+            else:
+                print(f"[Admin] Unknown command: {cmd}")
+
+        if _bot_loop and _bot_loop.is_running():
+            asyncio.run_coroutine_threadsafe(_run(), _bot_loop)
+        else:
+            threading.Thread(
+                target=lambda: asyncio.run(_run()), daemon=True
+            ).start()
+
+    # ──────────────── Helpers ────────────────
+    def _log(self, msg):
+        self._console.configure(state='normal')
+        ts = time.strftime("%H:%M:%S")
+        self._console.insert('end', f"[{ts}] {msg}\n")
+        self._console.see('end')
+        self._console.configure(state='disabled')
+
+    def _set_status(self, text, color):
+        self._status_dot.configure(text=f"  {text}", fg=color)
+
+    # ──────────────── Chain Parser ────────────────
+    def _parse_chain_input(self):
+        raw = self._chain_var.get().strip()
+        if not raw:
+            messagebox.showinfo("Empty", "Chain input is empty.")
+            return
+        parts = [p.strip() for p in raw.split('!') if p.strip()]
+        if not parts:
+            messagebox.showwarning("Parse Error", "No valid commands found.\nCommands must start with !.")
+            return
+        steps = []
+        for part in parts:
+            tokens = part.split(maxsplit=1)
+            steps.append({"action": tokens[0].lower(),
+                           "args":   tokens[1] if len(tokens) > 1 else ""})
+        self._step_items = steps
+        self._refresh_step_tree()
+        self._chain_var.set("")
+        self._log(f"[ChainParse] {len(steps)} step(s): "
+                  + "  ->  ".join(f"{s['action']}({s['args']})" for s in steps))
+
+    # ──────────────── Command Builder ────────────────
+    def _refresh_cmd_list(self):
+        self._cmd_listbox.delete(0,'end')
+        for t in sorted(custom_commands.keys()):
+            self._cmd_listbox.insert('end', t)
+
+    def _on_cmd_select(self, event=None):
+        sel = self._cmd_listbox.curselection()
+        if not sel: return
+        trigger = self._cmd_listbox.get(sel[0])
+        self._editing_cmd = trigger
+        self._trig_var.set(trigger)
+        self._step_items = list(custom_commands.get(trigger, []))
+        self._refresh_step_tree()
+
+    def _refresh_step_tree(self):
+        for r in self._step_tree.get_children():
+            self._step_tree.delete(r)
+        for i, s in enumerate(self._step_items):
+            tag = "even" if i%2==0 else "odd"
+            self._step_tree.insert("","end", values=(s["action"],s["args"]), tags=(tag,))
+        self._step_tree.tag_configure("even", background=self.BG3)
+        self._step_tree.tag_configure("odd",  background=self.BG2)
+
+    def _add_step(self):
+        action = self._action_var.get().strip()
+        args   = self._args_var.get().strip()
+        if not action: return
+        self._step_items.append({"action":action,"args":args})
+        self._refresh_step_tree()
+        self._args_var.set("")
+
+    def _selected_idx(self):
+        sel = self._step_tree.selection()
+        if not sel: return None
+        return list(self._step_tree.get_children()).index(sel[0])
+
+    def _step_up(self):
+        idx = self._selected_idx()
+        if idx is None or idx==0: return
+        self._step_items[idx-1],self._step_items[idx]=self._step_items[idx],self._step_items[idx-1]
+        self._refresh_step_tree()
+        self._step_tree.selection_set(self._step_tree.get_children()[idx-1])
+
+    def _step_down(self):
+        idx = self._selected_idx()
+        if idx is None or idx>=len(self._step_items)-1: return
+        self._step_items[idx],self._step_items[idx+1]=self._step_items[idx+1],self._step_items[idx]
+        self._refresh_step_tree()
+        self._step_tree.selection_set(self._step_tree.get_children()[idx+1])
+
+    def _step_remove(self):
+        idx = self._selected_idx()
+        if idx is None: return
+        self._step_items.pop(idx)
+        self._refresh_step_tree()
+
+    def _new_cmd(self):
+        self._editing_cmd=None; self._trig_var.set("!"); self._step_items=[]
+        self._refresh_step_tree(); self._cmd_listbox.selection_clear(0,'end')
+
+    def _save_cmd(self):
+        trigger = self._trig_var.get().strip()
+        if not trigger.startswith("!") or len(trigger)<2:
+            messagebox.showerror("Invalid Trigger", "Trigger must start with ! e.g. !bubbles")
+            return
+        custom_commands[trigger] = list(self._step_items)
+        save_custom_commands()
+        self._refresh_cmd_list()
+        self._log(f"[CustomCmd] Saved '{trigger}' with {len(self._step_items)} step(s).")
+
+    def _delete_cmd(self):
+        sel = self._cmd_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("Select", "Select a command to delete."); return
+        trigger = self._cmd_listbox.get(sel[0])
+        if messagebox.askyesno("Delete", f"Delete '{trigger}'?"):
+            del custom_commands[trigger]
+            save_custom_commands()
+            self._refresh_cmd_list()
+            self._new_cmd()
+            self._log(f"[CustomCmd] Deleted '{trigger}'.")
+
+    def _test_cmd(self):
+        trigger = self._trig_var.get().strip()
+        if trigger not in custom_commands:
+            messagebox.showinfo("Not Saved", "Save the command first, then test."); return
+        if _bot_loop:
+            asyncio.run_coroutine_threadsafe(
+                execute_custom_command_async(trigger), _bot_loop)
+        else:
+            threading.Thread(
+                target=lambda: asyncio.run(execute_custom_command_async(trigger)),
+                daemon=True).start()
+        self._log(f"[CustomCmd] Testing '{trigger}'...")
+
+
+
+def is_on_cooldown(cmd: str) -> bool:
+    now = time.time()
+    if cmd in last_command_time and now - last_command_time[cmd] < COOLDOWN.get(cmd, 5):
+        return True
+    last_command_time[cmd] = now
+    return False
+
+
+async def run_vmrun(args: list) -> bool:
+    try:
+        if not os.path.exists(VMRUN_PATH):
+            print(f"vmrun not found. Checked Program Files and Program Files (x86): {VMRUN_PATH}")
+            return False
+        # run_in_executor prevents subprocess.run from blocking the async loop.
+        loop   = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                [VMRUN_PATH] + args,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            ),
+        )
+        return result.returncode == 0
+    except Exception as e:
+        print(f"VMRun error: {e}")
+        return False
+
+
+# ========================= COMMAND PROCESSOR =========================
+async def process_command(message: str, author: str):
+    if not message.startswith(PREFIX):
+        return
+
+    # FIX: Old code used message.split(PREFIX) which split on every "!" including
+    # those inside arguments (e.g. "!type Hello! World" broke into two commands).
+    # New approach: strip the leading prefix once, then split only on " !" (space +
+    # prefix) so that "!" inside argument text is never treated as a command boundary.
+    content      = message[len(PREFIX):]
+    raw_commands = [cmd.strip() for cmd in content.split(f" {PREFIX}") if cmd.strip()]
+
+    active_voters[author] = time.time()
+
+    for raw_cmd in raw_commands:
+        parts = raw_cmd.split()
+        if not parts:
+            continue
+
+        command = parts[0].lower()
+        args    = parts[1:]
+
+        full_cmd_string = f"Running: {PREFIX}{command} {' '.join(args)}".strip()
+        asyncio.create_task(show_running_command(full_cmd_string))
+
+        # ---------- Custom commands (checked first) ----------
+        trigger = PREFIX + command
+        if trigger in custom_commands:
+            asyncio.create_task(execute_custom_command_async(trigger))
+            continue
+
+        # ---------- VM control commands ----------
+        if command == "startvm":
+            if is_on_cooldown("startvm"):
+                continue
+            # FIX: Was missing the required -T ws hosttype flags.
+            await run_vmrun(["-T", "ws", "start", VMX_PATH, "gui"])
+
+        elif command == "restartvm":
+            if votes["restartvm"]:
+                if author not in votes["restartvm"]:
+                    votes["restartvm"].append(author)
+                    update_vote_json(restart_time=VOTE_DURATION)
+                    # FIX: Guard against double execution via _executing_votes in
+                    # execute_vm_action — start_vote may also trigger it independently.
+                    if len(votes["restartvm"]) >= REQUIRED_VOTES:
+                        asyncio.create_task(execute_vm_action("restartvm"))
+            else:
+                asyncio.create_task(start_vote("restartvm", author))
+
+        elif command == "revert":
+            if votes["revert"]:
+                if author not in votes["revert"]:
+                    votes["revert"].append(author)
+                    update_vote_json(revert_time=VOTE_DURATION)
+                    if len(votes["revert"]) >= REQUIRED_VOTES:
+                        asyncio.create_task(execute_vm_action("revert"))
+            else:
+                asyncio.create_task(start_vote("revert", author))
+
+        # ---------- Keyboard commands ----------
+        elif command in ("key", "press") and args:
+            await controller.send_key(" ".join(args).lower())
+
+        elif command == "combo" and args:
+            full_input = "+".join(args).lower().replace(" ", "+")
+            while "++" in full_input:
+                full_input = full_input.replace("++", "+")
+            await controller.send_key(full_input)
+            await asyncio.sleep(1.0)
+
+        elif command == "hold" and args:
+            key_name = args[0].lower()
+            key      = SCANCODE_MAP.get(key_name, key_name)
+
+            # FIX: float() was called without error handling; non-numeric input crashed.
+            try:
+                hold_duration = float(args[1]) if len(args) > 1 else 1.0
+            except ValueError:
+                hold_duration = 1.0
+            hold_duration = min(hold_duration, 3.0)
+
+            controller._abort_hold = False
+            async with controller._lock:
+                client = await controller.connect_fresh()
+                if client:
+                    loop        = asyncio.get_running_loop()
+                    key_released = False
+                    try:
+                        await asyncio.wait_for(
+                            loop.run_in_executor(None, lambda: client.keyDown(key)),
+                            timeout=3.0,
+                        )
+                        elapsed = 0.0
+                        while elapsed < hold_duration and not controller._abort_hold:
+                            await asyncio.sleep(0.05)
+                            elapsed += 0.05
+                    finally:
+                        try:
+                            await asyncio.wait_for(
+                                loop.run_in_executor(None, lambda: client.keyUp(key)),
+                                timeout=3.0,
+                            )
+                            key_released = True
+                        except Exception:
+                            pass
+                        if not key_released:
+                            # Recovery: open a fresh connection and force-send keyUp.
+                            # FIX: retry up to 3 times in case the VNC server is briefly busy.
+                            for attempt in range(3):
+                                try:
+                                    rc = await asyncio.wait_for(
+                                        loop.run_in_executor(
+                                            None,
+                                            lambda: vnc.connect(
+                                                f"{VNC_HOST}::{VNC_PORT}",
+                                                password=str(VNC_PASSWORD),
+                                            ),
+                                        ),
+                                        timeout=5,
+                                    )
+                                    await asyncio.wait_for(
+                                        loop.run_in_executor(None, lambda: rc.keyUp(key)),
+                                        timeout=3.0,
+                                    )
+                                    rc.disconnect()
+                                    print(f"Key force-released via recovery connection (attempt {attempt+1}): {key}")
+                                    key_released = True
+                                    break
+                                except Exception:
+                                    await asyncio.sleep(0.5)
+                            if not key_released:
+                                print(f"WARN: Recovery keyUp failed after 3 attempts for: {key}")
+
+        elif command == "release" and args:
+            # FIX: Must acquire the lock before connect_fresh() so we don't
+            # disconnect a client that a concurrent hold/send_key is using.
+            async with controller._lock:
+                client = await controller.connect_fresh()
+                if client:
+                    key  = SCANCODE_MAP.get(args[0].lower(), args[0].lower())
+                    loop = asyncio.get_running_loop()
+                    try:
+                        await asyncio.wait_for(
+                            loop.run_in_executor(None, lambda: client.keyUp(key)),
+                            timeout=3.0,
+                        )
+                    except Exception:
+                        pass
+
+        elif command == "releaseall":
+            # Signal any active hold to abort immediately, THEN wait for the
+            # lock.  Because hold's while-loop has await asyncio.sleep() points,
+            # the event loop will let it see _abort_hold=True, exit the loop,
+            # run its finally (keyUp), and release the lock before we proceed.
+            # This eliminates the race condition where we used to just sleep 0.15 s
+            # and then call connect_fresh() while hold was still inside its lock.
+            controller._abort_hold = True
+            async with controller._lock:
+                client = await controller.connect_fresh()
+                if client:
+                    loop = asyncio.get_running_loop()
+                    # FIX: expanded list — any holdable key can get stuck, not just
+                    # classic modifiers.
+                    release_keys = [
+                        "shift", "ctrl", "control", "alt", "win", "super", "windows",
+                        "capslock", "tab", "enter", "space", "backspace",
+                        "up", "down", "left", "right",
+                        "f1","f2","f3","f4","f5","f6","f7","f8","f9","f10","f11","f12",
+                    ]
+                    released_values = set()
+                    for k in release_keys:
+                        mapped = SCANCODE_MAP.get(k)
+                        if mapped and mapped not in released_values:
+                            released_values.add(mapped)
+                            try:
+                                await asyncio.wait_for(
+                                    loop.run_in_executor(
+                                        None, lambda mk=mapped: client.keyUp(mk)
+                                    ),
+                                    timeout=2.0,
+                                )
+                            except Exception:
+                                pass
+                    print("All modifier keys released.")
+
+        # ---------- Text commands ----------
+        elif command in ("send", "typeenter") and args:
+            await controller.type_text(" ".join(args))
+            await asyncio.sleep(0.05)
+            await controller.send_key("enter")
+
+        elif command == "type" and args:
+            await controller.type_text(" ".join(args))
+
+        # ---------- Mouse commands ----------
+        elif command in ("move", "mouse", "mv") and args:
+            client = await controller.connect_fresh()
+            if client:
+                try:
+                    if args[0].isalpha():
+                        direction = args[0].lower()
+                        step      = int(args[1]) if len(args) > 1 and args[1].isdigit() else 40
+                        if direction == "up":    controller.cursor_y -= step
+                        elif direction == "down":  controller.cursor_y += step
+                        elif direction == "left":  controller.cursor_x -= step
+                        elif direction == "right": controller.cursor_x += step
+                        controller.cursor_x = max(0, min(1920, controller.cursor_x))
+                        controller.cursor_y = max(0, min(1080, controller.cursor_y))
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(
+                            None,
+                            lambda: client.mouseMove(controller.cursor_x, controller.cursor_y),
+                        )
+                    elif len(args) >= 2:
+                        dx, dy = int(args[0]), int(args[1])
+                        controller.cursor_x = max(0, min(1920, controller.cursor_x + dx))
+                        controller.cursor_y = max(0, min(1080, controller.cursor_y + dy))
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(
+                            None,
+                            lambda: client.mouseMove(controller.cursor_x, controller.cursor_y),
+                        )
+                except Exception:
+                    pass
+
+        elif command in ("abs", "cursor", "moveabs") and len(args) >= 2:
+            client = await controller.connect_fresh()
+            if client:
+                try:
+                    controller.cursor_x = max(0, min(1920, int(args[0])))
+                    controller.cursor_y = max(0, min(1080, int(args[1])))
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: client.mouseMove(controller.cursor_x, controller.cursor_y),
+                    )
+                except Exception:
+                    pass
+
+        elif command in ("drag", "dragrel") and len(args) >= 2:
+            client = await controller.connect_fresh()
+            if client:
+                try:
+                    dx, dy = int(args[0]), int(args[1])
+                    controller.cursor_x = max(0, min(1920, controller.cursor_x + dx))
+                    controller.cursor_y = max(0, min(1080, controller.cursor_y + dy))
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: client.mouseDrag(controller.cursor_x, controller.cursor_y),
+                    )
+                except Exception:
+                    pass
+
+        elif command in ("click", "lclick"):
+            client = await controller.connect_fresh()
+            if client:
+                count = int(args[0]) if args and args[0].isdigit() else 1
+                loop  = asyncio.get_running_loop()
+                for _ in range(count):
+                    await loop.run_in_executor(None, lambda: client.mousePress(1))
+                    await asyncio.sleep(0.01)
+
+        elif command in ("rclick", "rightclick"):
+            client = await controller.connect_fresh()
+            if client:
+                count = int(args[0]) if args and args[0].isdigit() else 1
+                loop  = asyncio.get_running_loop()
+                for _ in range(count):
+                    # FIX: Was mousePress(2) which is MIDDLE click in VNC protocol.
+                    # Right click is button 3.
+                    await loop.run_in_executor(None, lambda: client.mousePress(3))
+                    await asyncio.sleep(0.01)
+
+        elif command in ("scroll", "wheel") and args:
+            client = await controller.connect_fresh()
+            if client:
+                try:
+                    delta  = int(args[0])
+                    button = 4 if delta > 0 else 5  # 4 = scroll up, 5 = scroll down
+                    loop   = asyncio.get_running_loop()
+                    # FIX: Was "abs(delta) // 120" which treated deltas like Windows
+                    # WM_MOUSEWHEEL units; chat-sourced deltas are plain step counts
+                    # (1, 2, 3 …) so dividing by 120 always produced 0, making scroll
+                    # completely non-functional.
+                    for _ in range(abs(delta)):
+                        await loop.run_in_executor(None, lambda b=button: client.mousePress(b))
+                        await asyncio.sleep(0.01)
+                except Exception:
+                    pass
+
+        elif command == "wait" and args and args[0].replace(".", "", 1).isdigit():
+            await asyncio.sleep(min(float(args[0]), 5.0))
+
+
+# ========================= MAIN LOOPS =========================
+async def youtube_loop():
+    if not HAS_PYTCHAT:
+        print("[Chat] pytchat is not installed - YouTube chat features are disabled.")
+        return
+    while True:
+        chat       = None
+        chat_start = time.time()
+        try:
+            chat = pytchat.create(video_id=YOUTUBE_VIDEO_ID)
+            print("Chat connected.")
+
+            while chat.is_alive():
+                # Refresh the chat connection every 200 seconds.
+                if time.time() - chat_start > 200:
+                    print("Chat connection reset.")
+                    break
+
+                for c in chat.get().sync_items():
+                    msg = c.message.strip()
+                    if not msg:
+                        continue
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {c.author.name}: {msg}")
+                    update_overlay(author=c.author.name, message=msg, msg_id=c.id)
+                    if msg.startswith(PREFIX):
+                        await process_command(msg, c.author.name)
+
+                # Purge voters who have been inactive for more than 10 minutes
+                # to prevent active_voters from growing indefinitely.
+                cutoff = time.time() - 600
+                stale = [k for k, v in active_voters.items() if v < cutoff]
+                for k in stale:
+                    del active_voters[k]
+
+                await asyncio.sleep(0.4)
+
+        except Exception as e:
+            print(f"Chat loop error: {e}")
+            await asyncio.sleep(3)
+        finally:
+            if chat:
+                try:
+                    chat.terminate()
+                except Exception:
+                    pass
+
+        await asyncio.sleep(0.4)
+
+
+# ========================= MAIN =========================
+if __name__ == "__main__":
+    print_missing_libraries_report()
+    load_custom_commands()
+    root = tk.Tk()
+    app  = NexovativeControlCenterGUI(root)
+    root.mainloop()
+'''
+
+
+# ---------------------------------------------------------------------------
+# VMware tab host: process manager + tab UI (isolated, see notes above)
+# ---------------------------------------------------------------------------
+# (os, sys, json, time, subprocess, threading, tk, ttk are already imported above)
+
+_VMWARE_IS_WINDOWS = sys.platform == "win32"
+
+# Name of the file the embedded VMware source is written to before launching.
+VMWARE_SCRIPT_NAME = "vmware_embedded_27_3.py"
+
+# Own data folder for the VMware script's working directory.
+VMWARE_DATA_DIRNAME = "NexoVMwareFiles"
+
+# Settings for THIS tab (not the VMware script's own settings).
+VMWARE_HOST_CONFIG_NAME = "vmware_host_config.json"
+
+_VMWARE_DEFAULT_HOST_CONFIG = {
+    "script_path": "",          # empty = look next to the main script
+    "python_path": "",          # empty = same interpreter as the main script
+    "embed_window": False,      # OFF by default: embedding ties the two processes'
+                                # input queues together and can freeze this window
+    "auto_launch_on_open": False,  # OFF: opening the tab must never start anything by itself
+    "hide_isolation_warning": False,  # user ticked "Don't show this again" on the Start warning
+    "stop_on_leave": False,     # stop the process when leaving the tab
+}
+
+
+# ---------------------------------------------------------------------------
+# Paths / config
+# ---------------------------------------------------------------------------
+def _vmware_base_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _vmware_data_dir():
+    """Own folder for the VMware script's files (created on demand)."""
+    path = os.path.join(_vmware_base_dir(), VMWARE_DATA_DIRNAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _vmware_host_config_path():
+    return os.path.join(_vmware_data_dir(), VMWARE_HOST_CONFIG_NAME)
+
+
+def _vmware_load_host_config():
+    cfg = dict(_VMWARE_DEFAULT_HOST_CONFIG)
+    try:
+        p = _vmware_host_config_path()
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+            # One-time migration: the first release defaulted embedding to ON,
+            # which froze the main window. Turn it off for everyone once; after
+            # that the user's own choice in Settings is respected.
+            if not cfg.get("embed_migrated_v2"):
+                cfg["embed_window"] = False
+                cfg["embed_migrated_v2"] = True
+                _vmware_save_host_config(cfg)
+            # Same idea for auto-start: the first release defaulted it to ON,
+            # so opening the tab launched the script without the user asking.
+            # Turn it off once; afterwards the user's own choice is respected.
+            if not cfg.get("autolaunch_migrated_v3"):
+                cfg["auto_launch_on_open"] = False
+                cfg["autolaunch_migrated_v3"] = True
+                _vmware_save_host_config(cfg)
+    except Exception as e:
+        print(f"[VMware] Config load error: {e}")
+    return cfg
+
+
+def _vmware_save_host_config(cfg):
+    try:
+        with open(_vmware_host_config_path(), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"[VMware] Config save error: {e}")
+        return False
+
+
+def _vmware_resolve_script_path(cfg):
+    """
+    Returns the path of the VMware script to run.
+    If the user pointed the settings at their own .py file, that wins.
+    Otherwise the copy embedded in this file is written out (only when it
+    differs from what is already on disk) and that path is returned.
+    """
+    custom = (cfg.get("script_path") or "").strip().strip('"')
+    if custom:
+        return custom if os.path.isfile(custom) else None
+    path = os.path.join(_vmware_data_dir(), VMWARE_SCRIPT_NAME)
+    try:
+        existing = None
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                existing = f.read()
+        if existing != _VMWARE_SCRIPT_SOURCE:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(_VMWARE_SCRIPT_SOURCE)
+    except Exception as e:
+        print(f"[VMware] Could not write embedded script: {e}")
+        return None
+    return path
+
+
+def _vmware_resolve_python(cfg):
+    custom = (cfg.get("python_path") or "").strip().strip('"')
+    if custom and os.path.isfile(custom):
+        return custom
+    exe = sys.executable
+    # python.exe opens a console window for the child; pythonw.exe does not.
+    # The VMware script only uses its own Tk window and stdout redirection,
+    # so it needs no console. (Same approach the splash screen uses.)
+    if os.path.basename(exe).lower() == "python.exe":
+        candidate = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(candidate):
+            return candidate
+    return exe
+
+
+
+# Tiny launcher that runs the VMware script UNMODIFIED, but first puts the
+# child process in the same DPI-awareness mode as the main script. Without
+# this, a DPI-unaware window embedded into a DPI-aware parent renders blurry
+# or at the wrong size on scaled (125%/150%) displays.
+_VMWARE_LAUNCHER_SOURCE = r'''import sys, os, runpy
+if sys.platform == "win32":
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+script = sys.argv[1]
+sys.argv = [script]
+sys.path.insert(0, os.path.dirname(os.path.abspath(script)))
+runpy.run_path(script, run_name="__main__")
+'''
+
+_VMWARE_LAUNCHER_NAME = "_vmware_launcher.py"
+
+
+def _vmware_ensure_launcher():
+    """Writes the launcher next to the VMware data (never inside the VMware script)."""
+    path = os.path.join(_vmware_data_dir(), _VMWARE_LAUNCHER_NAME)
+    try:
+        existing = ""
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                existing = f.read()
+        if existing != _VMWARE_LAUNCHER_SOURCE:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(_VMWARE_LAUNCHER_SOURCE)
+    except Exception as e:
+        print(f"[VMware] Could not write launcher: {e}")
+        return None
+    return path
+
+# ---------------------------------------------------------------------------
+# Win32 helpers (only used on Windows; every call is guarded)
+# ---------------------------------------------------------------------------
+def _vmware_find_process_windows(pid):
+    """Returns HWNDs of visible top-level windows owned by `pid`."""
+    if not _VMWARE_IS_WINDOWS:
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found = []
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    def _cb(hwnd, _lparam):
+        try:
+            proc_id = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+            if proc_id.value == pid and user32.IsWindowVisible(hwnd):
+                # Skip tool/child helper windows: keep only ones with a title.
+                if user32.GetWindowTextLengthW(hwnd) > 0:
+                    found.append(hwnd)
+        except Exception:
+            pass
+        return True
+
+    user32.EnumWindows(EnumWindowsProc(_cb), 0)
+    return found
+
+
+def _vmware_embed_window(child_hwnd, parent_hwnd, width, height):
+    """Re-parents child_hwnd into parent_hwnd and strips its frame."""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    GWL_STYLE = -16
+    WS_CHILD = 0x40000000
+    WS_CAPTION = 0x00C00000
+    WS_THICKFRAME = 0x00040000
+    WS_SYSMENU = 0x00080000
+    WS_MINIMIZEBOX = 0x00020000
+    WS_MAXIMIZEBOX = 0x00010000
+    WS_POPUP = 0x80000000
+
+    style = user32.GetWindowLongW(child_hwnd, GWL_STYLE)
+    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU |
+               WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_POPUP)
+    style |= WS_CHILD
+    user32.SetWindowLongW(child_hwnd, GWL_STYLE, style)
+    user32.SetParent(child_hwnd, parent_hwnd)
+    user32.MoveWindow(child_hwnd, 0, 0, max(width, 100), max(height, 100), True)
+    user32.ShowWindow(child_hwnd, 5)  # SW_SHOW
+
+
+def _vmware_resize_child(child_hwnd, width, height):
+    import ctypes
+    ctypes.windll.user32.MoveWindow(child_hwnd, 0, 0, max(width, 100), max(height, 100), True)
+
+
+def _vmware_detach_window(child_hwnd):
+    """Best-effort: give the window back to the desktop (SetParent(NULL))."""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    GWL_STYLE = -16
+    WS_CHILD = 0x40000000
+    WS_OVERLAPPEDWINDOW = 0x00CF0000
+    WS_VISIBLE = 0x10000000
+    try:
+        user32.SetParent(child_hwnd, 0)
+        style = user32.GetWindowLongW(child_hwnd, GWL_STYLE)
+        style &= ~WS_CHILD
+        style |= WS_OVERLAPPEDWINDOW | WS_VISIBLE
+        user32.SetWindowLongW(child_hwnd, GWL_STYLE, style)
+        user32.ShowWindow(child_hwnd, 5)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Process manager (no Tk here, so it stays easy to reason about)
+# ---------------------------------------------------------------------------
+class VMwareProcess:
+    """Owns the child process. All methods are safe to call at any time."""
+
+    def __init__(self):
+        self.proc = None
+        self._lock = threading.Lock()
+        self.last_error = ""
+        self._kill_on_spawn = False   # set by stop() when start() is mid-Popen
+
+    @property
+    def running(self):
+        p = self.proc
+        return p is not None and p.poll() is None
+
+    @property
+    def pid(self):
+        return self.proc.pid if self.running else None
+
+    def start(self, cfg):
+        """Starts the VMware script. Returns (ok, message)."""
+        with self._lock:
+            self._kill_on_spawn = False
+            if self.running:
+                return True, "Already running."
+            script = _vmware_resolve_script_path(cfg)
+            if not script:
+                self.last_error = (
+                    f"The embedded VMware script could not be prepared. Check that the "
+                    "script folder is writable, or set a custom script path in the "
+                    "VMware tab settings."
+                )
+                return False, self.last_error
+            try:
+                flags = 0
+                if _VMWARE_IS_WINDOWS:
+                    # No console window for the child (it has its own Tk window).
+                    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                launcher = _vmware_ensure_launcher()
+                argv = ([_vmware_resolve_python(cfg), launcher, script] if launcher
+                        else [_vmware_resolve_python(cfg), script])
+                self.proc = subprocess.Popen(
+                    argv,
+                    cwd=_vmware_data_dir(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=flags,
+                )
+                self.last_error = ""
+                if self._kill_on_spawn:
+                    # stop() was requested while Popen was still running
+                    # (e.g. the app is closing). Honour it now.
+                    self._kill_on_spawn = False
+                    try:
+                        self.proc.kill()
+                        self.proc.wait(timeout=2.0)
+                    except Exception:
+                        pass
+                    self.proc = None
+                    return False, "Start cancelled."
+                return True, f"Started (PID {self.proc.pid})."
+            except Exception as e:
+                self.proc = None
+                self.last_error = f"Could not start: {e}"
+                return False, self.last_error
+
+    def stop(self, timeout=3.0):
+        """Terminates the child, escalating to kill. Returns True if it is gone."""
+        # start() holds the lock for the whole Popen call, which can take
+        # seconds on Windows. Never wait for it: flag the request and let
+        # start() kill the new process the moment it exists.
+        if not self._lock.acquire(timeout=0.2):
+            self._kill_on_spawn = True
+            return True
+        try:
+            p = self.proc
+            if p is None:
+                return True
+            try:
+                if p.poll() is None:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait(timeout=timeout)
+            except Exception:
+                pass
+            gone = p.poll() is not None
+            if gone:
+                self.proc = None
+            return gone
+        finally:
+            self._lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Tab UI
+# ---------------------------------------------------------------------------
+class VMwareTab:
+    """
+    Builds the "VMware (BETA)" tab into `parent` and manages the child process.
+
+    `theme` is a dict of colour names taken from the main GUI so the tab
+    matches without importing anything from the main script:
+        BG, BG2, BG3, TEXT, TEXTDIM, ACCENT, ACCENT2, GREEN, RED, YELLOW
+    """
+
+    def __init__(self, parent, theme, notebook=None):
+        self.parent = parent
+        self.t = theme
+        self.nb = notebook
+        self.cfg = _vmware_load_host_config()
+        self.pm = VMwareProcess()
+
+        self._hwnd = None
+        self._embedded = False
+        self._embed_job = None
+        self._poll_job = None
+        self._destroyed = False
+        self._busy = False      # True while a start/stop worker thread is running
+        self._ui_queue = queue.Queue()   # worker threads -> UI thread hand-off
+        self._ui_job = None
+
+        self._build()
+        self._schedule_poll()
+        self._ui_job = self.parent.after(50, self._drain_ui_queue)
+
+    # ------------------------------------------------------------ building
+    def _build(self):
+        t = self.t
+        for child in self.parent.winfo_children():
+            child.destroy()
+
+        top = tk.Frame(self.parent, bg=t["BG2"])
+        top.pack(fill="x")
+
+        tk.Label(top, text="VMware Script  (BETA)", bg=t["BG2"], fg=t["ACCENT2"],
+                 font=("Segoe UI", 12, "bold")).pack(side="left", padx=14, pady=8)
+
+        self._status = tk.Label(top, text="Stopped", bg=t["BG2"], fg=t["RED"],
+                                font=("Segoe UI", 10, "bold"))
+        self._status.pack(side="right", padx=14)
+
+        self._btn_bar = tk.Frame(self.parent, bg=t["BG"])
+        self._btn_bar.pack(fill="x", padx=10, pady=(8, 4))
+
+        self._btn_start = ttk.Button(self._btn_bar, text="▶ Start",
+                                     style="Green.TButton", command=self.start_with_warning)
+        self._btn_start.pack(side="left", padx=(0, 6))
+        self._btn_stop = ttk.Button(self._btn_bar, text="■ Stop",
+                                    style="Red.TButton", command=self.stop)
+        self._btn_stop.pack(side="left", padx=(0, 6))
+        self._btn_restart = ttk.Button(self._btn_bar, text="↻ Restart",
+                                       style="Dim.TButton", command=self.restart)
+        self._btn_restart.pack(side="left", padx=(0, 6))
+        self._btn_settings = ttk.Button(self._btn_bar, text="⚙ Settings",
+                                        style="Dim.TButton", command=self._toggle_settings)
+        self._btn_settings.pack(side="right")
+
+        self._settings_frame = tk.Frame(self.parent, bg=t["BG2"], padx=14, pady=10)
+        self._settings_open = False
+        self._build_settings(self._settings_frame)
+
+        # Container that the child window is embedded into.
+        self._host = tk.Frame(self.parent, bg="#000000", highlightthickness=1,
+                              highlightbackground=t["BG3"])
+        self._host.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+
+        self._info = tk.Label(self._host, text="", bg="#000000", fg=t["TEXTDIM"],
+                              font=("Segoe UI", 10), justify="center", wraplength=520)
+        self._info.place(relx=0.5, rely=0.5, anchor="center")
+        self._set_info(
+            "The VMware script runs as its own separate program,\n"
+            "fully isolated from the VirtualBox script.\n\n"
+            "Press  ▶ Start  to launch it."
+        )
+
+        self._host.bind("<Configure>", self._on_host_resize)
+        self._refresh_buttons()
+
+    def _build_settings(self, f):
+        t = self.t
+
+        def row(r, label, hint):
+            tk.Label(f, text=label, bg=t["BG2"], fg=t["TEXT"],
+                     font=("Segoe UI", 9, "bold")).grid(row=r * 2, column=0, sticky="w",
+                                                        pady=(8 if r else 0, 0))
+            tk.Label(f, text=hint, bg=t["BG2"], fg=t["TEXTDIM"], font=("Segoe UI", 8),
+                     wraplength=440, justify="left").grid(row=r * 2 + 1, column=0,
+                                                          columnspan=2, sticky="w")
+
+        self._var_script = tk.StringVar(value=self.cfg.get("script_path", ""))
+        self._var_python = tk.StringVar(value=self.cfg.get("python_path", ""))
+        self._var_embed = tk.BooleanVar(value=self.cfg.get("embed_window", True))
+        self._var_auto = tk.BooleanVar(value=self.cfg.get("auto_launch_on_open", False))
+        self._var_leave = tk.BooleanVar(value=self.cfg.get("stop_on_leave", False))
+        # Ticked = the Start warning is HIDDEN. The label below is phrased the
+        # other way round, so the variable is stored inverted (see _save_settings).
+        self._var_hide_warn = tk.BooleanVar(value=self.cfg.get("hide_isolation_warning", False))
+        self._var_show_warn = tk.BooleanVar(value=not self._var_hide_warn.get())
+        # Keep both views in sync when the dialog's "don't show again" flips it.
+        self._var_hide_warn.trace_add(
+            "write", lambda *_: self._var_show_warn.set(not self._var_hide_warn.get()))
+
+        row(0, "VMware script path", "Leave empty to use the VMware script built into this program.")
+        ttk.Entry(f, textvariable=self._var_script, width=44).grid(row=0, column=1, sticky="ew",
+                                                                   padx=(10, 0), ipady=3)
+        row(1, "Python interpreter", "Leave empty to use the same Python as the main script.")
+        ttk.Entry(f, textvariable=self._var_python, width=44).grid(row=2, column=1, sticky="ew",
+                                                                   padx=(10, 0), ipady=3)
+
+        def cb(r, var, text):
+            tk.Checkbutton(f, text=text, variable=var, bg=t["BG2"], fg=t["TEXT"],
+                           selectcolor=t["BG3"], activebackground=t["BG2"],
+                           activeforeground=t["TEXT"], font=("Segoe UI", 9)
+                           ).grid(row=r, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        cb(4, self._var_embed, "Embed the VMware window inside this tab  (EXPERIMENTAL - can freeze this window)")
+        cb(5, self._var_auto, "Start the VMware script automatically whenever I open this tab")
+        cb(6, self._var_leave, "Stop the VMware script when I leave this tab")
+        cb(7, self._var_show_warn, "Show the 'VMware is completely separate' warning when I press Start")
+
+        tk.Label(f, text=f"Its own files are stored in:  {VMWARE_DATA_DIRNAME}/",
+                 bg=t["BG2"], fg=t["TEXTDIM"], font=("Segoe UI", 8)
+                 ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        ttk.Button(f, text="💾 Save Settings", style="Green.TButton",
+                   command=self._save_settings).grid(row=9, column=0, sticky="w", pady=(10, 0))
+        self._saved_lbl = tk.Label(f, text="", bg=t["BG2"], fg=t["GREEN"], font=("Segoe UI", 9))
+        self._saved_lbl.grid(row=9, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
+        f.columnconfigure(1, weight=1)
+
+    # ------------------------------------------------------------ settings
+    def _toggle_settings(self):
+        if self._settings_open:
+            self._settings_frame.pack_forget()
+        else:
+            self._settings_frame.pack(fill="x", padx=10, pady=(0, 4), before=self._host)
+        self._settings_open = not self._settings_open
+
+    def _save_settings(self):
+        self.cfg["script_path"] = self._var_script.get().strip()
+        self.cfg["python_path"] = self._var_python.get().strip()
+        self.cfg["embed_window"] = bool(self._var_embed.get())
+        self.cfg["auto_launch_on_open"] = bool(self._var_auto.get())
+        self.cfg["stop_on_leave"] = bool(self._var_leave.get())
+        self.cfg["hide_isolation_warning"] = not bool(self._var_show_warn.get())
+        ok = _vmware_save_host_config(self.cfg)
+        self._saved_lbl.configure(
+            text="Saved. Restart the VMware script to apply." if ok else "Save failed.",
+            fg=self.t["GREEN"] if ok else self.t["RED"])
+
+    # ------------------------------------------------------------- helpers
+    def _set_info(self, text):
+        try:
+            self._info.configure(text=text)
+            self._info.place(relx=0.5, rely=0.5, anchor="center")
+        except Exception:
+            pass
+
+    def _hide_info(self):
+        try:
+            self._info.place_forget()
+        except Exception:
+            pass
+
+    def _set_status(self, text, color):
+        try:
+            self._status.configure(text=text, fg=color)
+        except Exception:
+            pass
+
+    def _refresh_buttons(self):
+        running = self.pm.running
+        busy = getattr(self, "_busy", False)
+        try:
+            self._btn_start.state(["disabled"] if (running or busy) else ["!disabled"])
+            self._btn_stop.state(["!disabled"] if (running and not busy) else ["disabled"])
+            self._btn_restart.state(["!disabled"] if (running and not busy) else ["disabled"])
+        except Exception:
+            pass
+
+    # ------------------------------------------------------ start / stop
+    # ------------------------------------------------ isolation warning
+    _WARNING_TITLE = "VMware (BETA) is completely separate"
+    _WARNING_INTRO = (
+        "The VMware script is a separate program that only happens to be "
+        "shown inside this window. It is NOT connected to the VirtualBox "
+        "part of Nexovative Control Center in any way."
+    )
+    _WARNING_POINTS = (
+        ("Settings do NOT carry over",
+         "Nothing you configured in the VirtualBox tabs applies to the VMware "
+         "script. That includes your VM selection, chat and YouTube settings, "
+         "voting rules, cooldowns, custom commands, chaos events, OBS, overlay "
+         "and every other option."),
+        ("It has its own settings",
+         "The VMware script has its own settings, its own VM list and its own "
+         "commands. Set everything up again inside the VMware window."),
+        ("Its data is stored separately",
+         "Its files are kept in the  NexoVMwareFiles  folder, so changes made "
+         "there never affect your VirtualBox setup, and the other way around."),
+        ("Nothing is shared",
+         "The two run as different programs. Starting, stopping or crashing "
+         "one does not affect the other."),
+    )
+
+    def start_with_warning(self):
+        """
+        Handler for the Start button only. Shows the isolation notice first,
+        and starts the script only if the user confirms.
+
+        Deliberately separate from start(): Restart and the optional
+        auto-start call start() directly and must not nag the user again.
+        """
+        if self._destroyed or self._busy or self.pm.running:
+            return
+        if self.cfg.get("hide_isolation_warning", False):
+            self.start()
+            return
+        self._show_isolation_warning(self._on_warning_answer)
+
+    def _on_warning_answer(self, proceed, dont_show_again):
+        if dont_show_again:
+            self.cfg["hide_isolation_warning"] = True
+            _vmware_save_host_config(self.cfg)
+            try:
+                self._var_hide_warn.set(True)   # keep the Settings checkbox in sync
+            except Exception:
+                pass
+        if proceed:
+            self.start()
+
+    def _show_isolation_warning(self, on_answer):
+        """Modal dialog. Calls on_answer(proceed: bool, dont_show_again: bool) once."""
+        t = self.t
+        top = self.parent.winfo_toplevel()
+        dlg = tk.Toplevel(top)
+        dlg.title("VMware (BETA)")
+        dlg.configure(bg=t["BG"])
+        dlg.resizable(False, False)
+        dlg.transient(top)
+
+        answered = {"done": False}
+        dont_show = tk.BooleanVar(value=False)
+
+        def finish(proceed):
+            if answered["done"]:
+                return
+            answered["done"] = True
+            flag = bool(dont_show.get()) and proceed   # only remember on Continue
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            dlg.destroy()
+            on_answer(proceed, flag)
+
+        # Header strip (same visual language as the app's other dialogs)
+        hdr = tk.Frame(dlg, bg=t["YELLOW"], height=50)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="⚠  " + self._WARNING_TITLE, bg=t["YELLOW"], fg="#1a1a2e",
+                 font=("Segoe UI", 12, "bold")).pack(side="left", padx=18)
+
+        body = tk.Frame(dlg, bg=t["BG"], padx=22, pady=16)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body, text=self._WARNING_INTRO, bg=t["BG"], fg=t["TEXT"],
+                 font=("Segoe UI", 10, "bold"), wraplength=500, justify="left"
+                 ).pack(anchor="w", pady=(0, 12))
+
+        for heading, text in self._WARNING_POINTS:
+            row = tk.Frame(body, bg=t["BG2"], padx=12, pady=8)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=heading, bg=t["BG2"], fg=t["ACCENT2"],
+                     font=("Segoe UI", 10, "bold"), anchor="w").pack(anchor="w")
+            tk.Label(row, text=text, bg=t["BG2"], fg=t["TEXT"], font=("Segoe UI", 9),
+                     wraplength=480, justify="left", anchor="w").pack(anchor="w", pady=(2, 0))
+
+        tk.Checkbutton(body, text="Don't show this warning again", variable=dont_show,
+                       bg=t["BG"], fg=t["TEXTDIM"], selectcolor=t["BG3"],
+                       activebackground=t["BG"], activeforeground=t["TEXT"],
+                       font=("Segoe UI", 9)).pack(anchor="w", pady=(12, 0))
+
+        btns = tk.Frame(body, bg=t["BG"])
+        btns.pack(fill="x", pady=(14, 0))
+        cont = ttk.Button(btns, text="I understand, start VMware", style="Green.TButton",
+                          command=lambda: finish(True))
+        cont.pack(side="right")
+        ttk.Button(btns, text="Cancel", style="Dim.TButton",
+                   command=lambda: finish(False)).pack(side="right", padx=(0, 8))
+
+        dlg.protocol("WM_DELETE_WINDOW", lambda: finish(False))   # X button = Cancel
+        dlg.bind("<Escape>", lambda e: finish(False))
+        dlg.bind("<Return>", lambda e: finish(True))
+
+        # Centre over the main window, then make it modal
+        dlg.update_idletasks()
+        w, h = max(dlg.winfo_reqwidth(), 560), dlg.winfo_reqheight()
+        try:
+            x = top.winfo_rootx() + (top.winfo_width() - w) // 2
+            y = top.winfo_rooty() + (top.winfo_height() - h) // 2
+        except Exception:
+            x = y = 100
+        # Keep the whole dialog on screen even when the main window is small
+        # or sits near an edge (otherwise the title strip or buttons can end up
+        # off-screen and unreachable).
+        try:
+            sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+            x = min(max(x, 0), max(sw - w, 0))
+            y = min(max(y, 0), max(sh - h - 40, 0))   # -40: leave room for a taskbar
+        except Exception:
+            x, y = max(x, 0), max(y, 0)
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+        dlg.lift()
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        # Without an explicit focus grab the window manager may leave keyboard
+        # focus on the main window, which makes Escape / Enter do nothing.
+        # Done after the window is mapped, on the next idle cycle.
+        def _take_focus():
+            try:
+                if dlg.winfo_exists() and not answered["done"]:
+                    dlg.focus_force()
+                    cont.focus_set()
+            except Exception:
+                pass
+        dlg.after_idle(_take_focus)
+        dlg.after(150, _take_focus)     # second try: some WMs map the window late
+
+    def start(self):
+        if self._destroyed or self._busy:
+            return
+        self._busy = True
+        self._set_status("Starting…", self.t["YELLOW"])
+        self._set_info("Starting the VMware script…")
+        self._refresh_buttons()
+        cfg = dict(self.cfg)
+
+        def work():
+            # Popen can take seconds on Windows (antivirus scan of a new
+            # process), so it must never run on the UI thread.
+            try:
+                result = self.pm.start(cfg)
+            except Exception as e:
+                result = (False, f"Could not start: {e}")
+            self._post(lambda: self._after_start(*result))
+
+        threading.Thread(target=work, daemon=True, name="vmware_start").start()
+
+    def _after_start(self, ok, msg):
+        self._busy = False
+        if self._destroyed:
+            return
+        if not ok:
+            self._set_status("Error", self.t["RED"])
+            self._set_info(msg)
+            self._refresh_buttons()
+            return
+        print(f"[VMware] {msg}")
+        self._hwnd = None
+        self._embedded = False
+        self._refresh_buttons()
+        self._begin_embed_search()
+
+    def stop(self, then=None):
+        if self._busy:
+            return
+        self._busy = True
+        self._cancel_jobs()
+        if self._embedded and self._hwnd and _VMWARE_IS_WINDOWS:
+            try:
+                _vmware_detach_window(self._hwnd)
+            except Exception:
+                pass
+        self._set_status("Stopping…", self.t["YELLOW"])
+        self._refresh_buttons()
+
+        def work():
+            # terminate()/wait() can block for seconds; keep it off the UI thread.
+            try:
+                gone = self.pm.stop()
+            except Exception:
+                gone = False
+            self._post(lambda: self._after_stop(gone, then))
+
+        threading.Thread(target=work, daemon=True, name="vmware_stop").start()
+
+    def _after_stop(self, gone, then):
+        self._busy = False
+        if self._destroyed:
+            return
+        self._hwnd = None
+        self._embedded = False
+        self._set_status("Stopped" if gone else "Stop failed",
+                         self.t["RED"] if gone else self.t["YELLOW"])
+        self._set_info(
+            "VMware script stopped.\n\nPress  ▶ Start  to launch it again." if gone
+            else "Could not stop the VMware script. Close its window manually.")
+        self._refresh_buttons()
+        if then is not None and gone:
+            then()
+
+    def _post(self, fn):
+        """
+        Hand fn to the UI thread. Safe to call from worker threads.
+
+        Tk is not thread-safe: calling widget.after() from a worker raises
+        "main thread is not in main loop" in some states. So workers only
+        append to a queue; the UI thread drains it from _drain_ui_queue().
+        """
+        try:
+            self._ui_queue.put_nowait(fn)
+        except Exception:
+            pass
+
+    def _drain_ui_queue(self):
+        self._ui_job = None
+        if self._destroyed:
+            return
+        try:
+            while True:
+                try:
+                    fn = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    fn()
+                except Exception as e:
+                    print(f"[VMware] UI callback error: {e}")
+        finally:
+            if not self._destroyed:
+                self._ui_job = self.parent.after(50, self._drain_ui_queue)
+
+    def restart(self):
+        self.stop(then=self.start)
+
+    # --------------------------------------------------------- embedding
+    def _begin_embed_search(self):
+        """Polls briefly for the child's window; embeds it if allowed."""
+        if not (_VMWARE_IS_WINDOWS and self.cfg.get("embed_window", True)):
+            # Not embedding: the child simply lives in its own window.
+            self._set_status("Running (own window)", self.t["GREEN"])
+            self._set_info(
+                "The VMware script is running in its own window.\n"
+                "Look for 'VMware Control Center' in your taskbar."
+                if _VMWARE_IS_WINDOWS else
+                "The VMware script is running in its own window.\n"
+                "(Embedding into the tab is only supported on Windows.)")
+            return
+        self._embed_deadline = time.time() + 20.0
+        self._try_embed()
+
+    def _try_embed(self):
+        if self._destroyed or not self.pm.running:
+            return
+        pid = self.pm.pid
+        try:
+            windows = _vmware_find_process_windows(pid) if pid else []
+        except Exception:
+            windows = []
+        if windows:
+            hwnd = windows[0]
+            try:
+                self._host.update_idletasks()
+                _vmware_embed_window(hwnd, self._host.winfo_id(),
+                              self._host.winfo_width(), self._host.winfo_height())
+                self._hwnd = hwnd
+                self._embedded = True
+                self._hide_info()
+                self._set_status("Running (embedded)", self.t["GREEN"])
+                return
+            except Exception as e:
+                print(f"[VMware] Embed failed, leaving it as its own window: {e}")
+                self._set_status("Running (own window)", self.t["GREEN"])
+                self._set_info("The VMware script is running in its own window.")
+                return
+        if time.time() > self._embed_deadline:
+            self._set_status("Running (own window)", self.t["GREEN"])
+            self._set_info("The VMware script is running, but its window could not be "
+                           "captured into the tab.")
+            return
+        self._embed_job = self.parent.after(250, self._try_embed)
+
+    def _on_host_resize(self, event):
+        if self._embedded and self._hwnd and _VMWARE_IS_WINDOWS:
+            try:
+                _vmware_resize_child(self._hwnd, event.width, event.height)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------ polling
+    def _schedule_poll_needed(self):
+        return not self._destroyed and self._poll_job is None
+
+    def _schedule_poll(self):
+        if self._destroyed:
+            return
+        self._poll_job = self.parent.after(1000, self._poll)
+
+    def _poll(self):
+        self._poll_job = None
+        if self._destroyed:
+            return
+        try:
+            # While a start/stop worker is in flight the process state is in
+            # transition; judging it now would report a false "exited".
+            if self._busy:
+                return
+            was_active = self._embedded or self._status.cget("text").startswith("Running")
+            if was_active and not self.pm.running:
+                # The child exited on its own (user closed its window / crashed).
+                self._embedded = False
+                self._hwnd = None
+                self._set_status("Stopped", self.t["RED"])
+                self._set_info("The VMware script has exited.\n\nPress  ▶ Start  to launch it again.")
+                self._refresh_buttons()
+        finally:
+            self._schedule_poll()
+
+    def _cancel_jobs(self):
+        for attr in ("_embed_job",):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.parent.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+    # ------------------------------------------------------ tab lifecycle
+    def on_tab_selected(self):
+        """Call when the user switches TO this tab."""
+        if self.cfg.get("auto_launch_on_open", False) and not self.pm.running:
+            self.start()
+
+    def on_tab_deselected(self):
+        """Call when the user switches AWAY from this tab."""
+        if self.cfg.get("stop_on_leave", False) and self.pm.running:
+            self.stop()
+
+    def shutdown(self):
+        """Call when the whole application closes. Never raises."""
+        self._destroyed = True
+        self._cancel_jobs()
+        if self._ui_job is not None:
+            try:
+                self.parent.after_cancel(self._ui_job)
+            except Exception:
+                pass
+            self._ui_job = None
+        if self._poll_job is not None:
+            try:
+                self.parent.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+        try:
+            if self._embedded and self._hwnd and _VMWARE_IS_WINDOWS:
+                _vmware_detach_window(self._hwnd)
+        except Exception:
+            pass
+        try:
+            # stop() never waits on a start() that is still inside Popen: it
+            # flags the request and start() kills the new process itself, so
+            # closing the app is instant and nothing is left orphaned.
+            self.pm.stop(timeout=1.0)
+        except Exception:
+            pass
+
+
+
 class NexovativeControlCenter:
     # ── Color palette ──
     BG       = "#0f0f1a"
@@ -7412,6 +10022,10 @@ class NexovativeControlCenter:
         # depend on order (nb.add() below); its index used everywhere else
         # is whatever nb.index() reports at runtime for tab17 specifically.
         tab17 = ttk.Frame(nb)
+        # v32.1: standalone VMware script hosted in its own tab. It runs as a
+        # completely separate process (see the VMWARE TAB section) and shares no
+        # state, files or settings with anything in this script.
+        tab18 = ttk.Frame(nb)
         nb.add(tab1,  text="▶ Main")
         nb.add(tab17, text="⚡ Chaos")
         nb.add(tab2,  text="⚙ Cmds")
@@ -7429,6 +10043,7 @@ class NexovativeControlCenter:
         nb.add(tab14, text="🖱 Real PC (BETA)")
         nb.add(tab15, text="🔄 Reconnect")
         nb.add(tab16, text="🤖 NexoAI")
+        nb.add(tab18, text="🖥 VMware (BETA)")
         self._fun_tab_anchor = tab15   # hidden Fun tab (easter egg) is inserted right before this one
         self._chaos_tab_idx  = lambda: nb.index(tab17)   # resolved lazily; avoids hardcoding a number
 
@@ -7562,6 +10177,7 @@ class NexovativeControlCenter:
 
             self._lazy_tab_built = set()
             nb.bind("<<NotebookTabChanged>>", _build_tab_on_first_view, add="+")
+        self._build_vmware_tab_safe(nb, tab18)
         self._sync_main_vm_lock()
         self._nb = nb   # store reference for unsaved-changes guard
         self._bind_context_menus()   # attach right-click menus to all Entry/Text widgets
@@ -7967,6 +10583,51 @@ class NexovativeControlCenter:
             except Exception:
                 pass
         self.root.after(0, _do)
+
+    # ──────────────── TAB : VMWARE (BETA, v32.1) ────────────────
+    def _build_vmware_tab_safe(self, nb, frame):
+        """
+        Hosts the standalone VMware script in its own tab.
+
+        Isolation: everything is delegated to the VMwareTab class, which runs
+        the VMware script as a separate OS process with its own working
+        folder. Nothing in this file is shared with it, and any failure here
+        is contained: if the helper module is missing or errors out, only
+        this one tab shows a message and the rest of the app is unaffected.
+        """
+        self._vmware_tab = None
+        try:
+            theme = {k: getattr(self, k) for k in
+                     ("BG", "BG2", "BG3", "TEXT", "TEXTDIM",
+                      "ACCENT", "ACCENT2", "GREEN", "RED", "YELLOW")}
+            self._vmware_tab = VMwareTab(frame, theme, nb)
+        except Exception as e:
+            for child in frame.winfo_children():
+                child.destroy()
+            tk.Label(frame,
+                     text=("VMware tab could not be loaded.\n\n"
+                           f"{e}\n\n"
+                           "The rest of the program is not affected."),
+                     bg=self.BG, fg=self.RED, font=("Segoe UI", 10),
+                     justify="center").pack(expand=True)
+            print(f"[VMware] Tab disabled: {e}")
+            return
+
+        vt = self._vmware_tab
+
+        def _on_vmware_tab_event(_event=None):
+            # Separate binding (add="+"): never interferes with the app's own
+            # tab-switch handlers, and never raises into them.
+            try:
+                current = nb.nametowidget(nb.select())
+                if current is frame:
+                    vt.on_tab_selected()
+                else:
+                    vt.on_tab_deselected()
+            except Exception as ex:
+                print(f"[VMware] Tab event error: {ex}")
+
+        nb.bind("<<NotebookTabChanged>>", _on_vmware_tab_event, add="+")
 
     # ──────────────── TAB : CHAOS EVENTS (v32.0) ────────────────
     def _build_chaos_tab(self, parent):
@@ -13785,6 +16446,7 @@ if __name__ == '__main__':
     root = _host_root
     _gui_root = root
     app  = NexovativeControlCenter(root)   # builds GUI while root is still hidden
+    root._nexo_app = app    # lets _shutdown_vmware_child() find the VMware tab on exit
 
     _update_splash(100, "Ready!")
     time.sleep(0.25)    # let the user see 100% for a moment
@@ -13821,6 +16483,7 @@ if __name__ == '__main__':
             root.withdraw()
             notify("Running in Tray", "Bot is still running. Right-click the tray icon to exit.")
         elif answer == IDNO:
+            _shutdown_vmware_child()
             bot_stop_event.set()
             stop_realpc_bot()
             stop_tray_icon()
