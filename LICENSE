@@ -1,0 +1,93 @@
+Nexovative Source-Available License, Version 1.0
+
+Copyright (c) 2026 Nexovative (https://github.com/Nexovative-D)
+All rights reserved, except as expressly granted below.
+
+1. DEFINITIONS
+
+"Software" means the source code, documentation, and any other files
+contained in this repository, together with any modifications made by
+the Licensor.
+
+"Licensor" means Nexovative.
+
+"You" means the individual or legal entity exercising permissions
+granted by this License.
+
+"Commercial Use" means any use of the Software that is primarily
+intended for or directed toward commercial advantage or monetary
+compensation, including but not limited to selling, sublicensing,
+offering the Software as a paid or hosted service, or incorporating
+it into a product or service that is sold or monetized.
+
+2. GRANT OF PERMISSION
+
+Subject to the terms of this License, the Licensor grants You a
+limited, non-exclusive, non-transferable, revocable license to:
+
+a) View, read, and study the source code;
+b) Download and run the Software for personal, educational, research,
+   or internal evaluation purposes;
+c) Modify the Software for Your own personal, non-commercial use;
+d) Fork the repository on GitHub, as permitted by the GitHub Terms of
+   Service, and propose changes back to the Licensor via pull request.
+
+3. RESTRICTIONS
+
+Unless You have obtained prior written permission from the Licensor,
+You may NOT:
+
+a) Use the Software, in whole or in part, for Commercial Use;
+b) Distribute, publish, sublicense, sell, or otherwise make available
+   the Software or any modified version of it to third parties, other
+   than through a GitHub fork as described in Section 2(d);
+c) Offer the Software, or any functionality derived from it, as a
+   hosted, managed, or software-as-a-service product;
+d) Remove or alter any copyright, license, or attribution notices;
+e) Use the name "Nexovative" or any associated branding to endorse or
+   promote derivative works without prior written permission;
+f) Use the Software to train, fine-tune, or benchmark commercial
+   machine-learning models.
+
+4. CONTRIBUTIONS
+
+If You submit a contribution (e.g., a pull request) to the Licensor,
+You grant the Licensor a perpetual, worldwide, non-exclusive,
+royalty-free, irrevocable license to use, modify, and distribute that
+contribution as part of the Software, under this or any other license
+the Licensor chooses. You confirm that You have the right to grant
+this license.
+
+5. OWNERSHIP
+
+The Software is licensed, not sold. The Licensor retains all right,
+title, and interest in and to the Software. No rights are granted
+except those expressly stated in this License.
+
+6. TERMINATION
+
+This License terminates automatically if You breach any of its terms.
+Upon termination, You must stop using the Software and delete all
+copies in Your possession. Sections 5, 7, 8, and 9 survive termination.
+
+7. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+NONINFRINGEMENT.
+
+8. LIMITATION OF LIABILITY
+
+IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+9. GENERAL
+
+If any provision of this License is held unenforceable, the remaining
+provisions remain in full effect. The Licensor's failure to enforce
+any provision is not a waiver of that provision. For commercial
+licensing or other permissions, contact the Licensor via
+https://github.com/Nexovative-D

@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>OBS Vote Overlay</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html, body {
+            background-color: transparent;
+            width: 320px;
+            overflow: hidden;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: white;
+            padding: 10px;
+        }
+
+        .vote-box {
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.9);
+            transform: translateZ(0);
+        }
+
+        /* RESTART — green */
+        #restart-box {
+            background-color: #0a2a12;
+            border: 2px solid #00ff87;
+        }
+
+        #restart-box .vote-title  { color: #00ff87; text-shadow: 0 0 10px rgba(0,255,135,0.8); }
+        #restart-box .vote-info   { color: #ccffdd; }
+        #restart-box .vote-info.timer { color: #aaffcc; }
+        #restart-box .progress-container { background-color: #0a2010; border: 1px solid #00aa55; }
+        #restart-box .progress-bar {
+            background: linear-gradient(90deg, #00aa55, #00ff87);
+            box-shadow: 0 0 8px #00ff87;
+        }
+
+        /* REVERT — blue */
+        #revert-box {
+            background-color: #0a1a3a;
+            border: 2px solid #00aaff;
+        }
+
+        #revert-box .vote-title  { color: #00aaff; text-shadow: 0 0 10px rgba(0,170,255,0.8); }
+        #revert-box .vote-info   { color: #cceeff; }
+        #revert-box .vote-info.timer { color: #aaddff; }
+        #revert-box .progress-container { background-color: #071525; border: 1px solid #0066aa; }
+        #revert-box .progress-bar {
+            background: linear-gradient(90deg, #0066cc, #00aaff);
+            box-shadow: 0 0 8px #00aaff;
+        }
+
+        .vote-title {
+            font-size: 18px;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+
+        .vote-info {
+            font-size: 15px;
+            font-weight: 700;
+            text-align: center;
+            margin-bottom: 5px;
+        }
+
+        .vote-info.timer {
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .progress-container {
+            border-radius: 10px;
+            width: 100%;
+            height: 12px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            height: 100%;
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        /* Attribution watermark — kept minimal and semi-transparent so it
+           doesn't clutter the overlay, but re-injected by JS on every
+           render cycle (see renderWatermark()) so it survives a casual
+           edit of the static HTML below. */
+        #nexovative-credit {
+            margin-top: 8px;
+            text-align: center;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.4px;
+            color: #ffffff;
+            background: rgba(0,0,0,0.55);
+            border: 1px solid rgba(255,255,255,0.25);
+            border-radius: 8px;
+            padding: 4px 10px;
+            display: block;
+            text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+            user-select: none;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="vote-box" id="restart-box">
+        <div class="vote-title">⟳ Restart Vote</div>
+        <div class="vote-info" id="restart-collected">0 / 2 votes</div>
+        <div class="vote-info timer" id="restart-time">Waiting...</div>
+        <div class="progress-container">
+            <div class="progress-bar" id="restart-bar"></div>
+        </div>
+    </div>
+
+    <div class="vote-box" id="revert-box">
+        <div class="vote-title">↩ Revert Vote</div>
+        <div class="vote-info" id="revert-collected">0 / 2 votes</div>
+        <div class="vote-info timer" id="revert-time">Waiting...</div>
+        <div class="progress-container">
+            <div class="progress-bar" id="revert-bar"></div>
+        </div>
+    </div>
+
+    <div id="nexovative-credit">Script by @Nexovative</div>
+
+    <script>
+        const state = {
+            restartvm: { remaining: 0, interval: null, required: 2, current: 0 },
+            revert:    { remaining: 0, interval: null, required: 2, current: 0 }
+        };
+
+        const elements = {
+            restartvm: {
+                box:       document.getElementById('restart-box'),
+                collected: document.getElementById('restart-collected'),
+                time:      document.getElementById('restart-time'),
+                bar:       document.getElementById('restart-bar')
+            },
+            revert: {
+                box:       document.getElementById('revert-box'),
+                collected: document.getElementById('revert-collected'),
+                time:      document.getElementById('revert-time'),
+                bar:       document.getElementById('revert-bar')
+            }
+        };
+
+        function updateDisplay(type) {
+            const s = state[type];
+            const el = elements[type];
+            const active = s.remaining > 0;
+            el.collected.textContent = `${s.current} / ${s.required} votes`;
+            el.time.textContent = active ? `⏱ ${s.remaining}s remaining` : 'Waiting...';
+            const pct = s.required > 0 ? (s.current / s.required) * 100 : 0;
+            el.bar.style.width = Math.min(pct, 100) + '%';
+        }
+
+        function startClientCountdown(type, fromSeconds) {
+            const s = state[type];
+            if (s.interval) { clearInterval(s.interval); s.interval = null; }
+            s.remaining = fromSeconds;
+            updateDisplay(type);
+            if (fromSeconds <= 0) return;
+            s.interval = setInterval(() => {
+                if (s.remaining > 0) {
+                    s.remaining--;
+                    updateDisplay(type);
+                } else {
+                    clearInterval(s.interval);
+                    s.interval = null;
+                    updateDisplay(type);
+                }
+            }, 1000);
+        }
+
+        function syncFromServer(type, serverRemaining, serverCurrent, serverRequired) {
+            const s = state[type];
+            s.current  = serverCurrent;
+            s.required = serverRequired;
+            const diff = Math.abs(serverRemaining - s.remaining);
+            if (serverRemaining <= 0) {
+                if (s.interval) { clearInterval(s.interval); s.interval = null; }
+                s.remaining = 0;
+                updateDisplay(type);
+            } else if (!s.interval || diff > 2) {
+                startClientCountdown(type, serverRemaining);
+            } else {
+                updateDisplay(type);
+            }
+        }
+
+        function renderWatermark() {
+            // Re-creates the credit line if it's not present in the DOM —
+            // this runs on every poll cycle, so removing the static HTML
+            // line alone doesn't remove the credit; it just comes back on
+            // the next tick.
+            if (!document.getElementById('nexovative-credit')) {
+                const el = document.createElement('div');
+                el.id = 'nexovative-credit';
+                el.textContent = 'Script by @Nexovative';
+                document.body.appendChild(el);
+            }
+        }
+
+        function fetchVotes() {
+            renderWatermark();
+            fetch('votes.json?t=' + Date.now())
+                .then(r => r.json())
+                .then(data => {
+                    syncFromServer('restartvm',
+                        data.restartvm.remaining_time,
+                        data.restartvm.current,
+                        data.restartvm.required
+                    );
+                    syncFromServer('revert',
+                        data.revert.remaining_time,
+                        data.revert.current,
+                        data.revert.required
+                    );
+                })
+                .catch(() => {});
+        }
+
+        setInterval(fetchVotes, 2000);
+        fetchVotes();
+    </script>
+</body>
+</html>

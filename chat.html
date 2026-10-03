@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap');
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Space Grotesk', -apple-system, sans-serif;
+            background: transparent;
+            color: #ffffff;
+            overflow: hidden;
+        }
+
+        #chat-container {
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            height: 520px;
+            width: 440px;
+            padding: 16px;
+            gap: 10px;
+        }
+
+        #messages-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        /* Semi-transparent dark card */
+        .chat-message {
+            position: relative;
+            background: rgba(14, 15, 18, 0.72);
+            padding: 10px 15px;
+            border-radius: 10px;
+
+            border: 1px solid rgba(255, 255, 255, 0.07);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+
+            box-shadow:
+                0 4px 24px rgba(0, 0, 0, 0.30),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05);
+
+            line-height: 1.5;
+            word-break: break-word;
+
+            will-change: transform, opacity;
+            transform: translateZ(0);
+        }
+
+        /* Subtle left accent glow per color */
+        .chat-message::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 20%;
+            bottom: 20%;
+            width: 2px;
+            border-radius: 2px;
+            opacity: 0.7;
+        }
+
+        .chat-message:nth-child(5n+1)::before { background: #ff4a7a; }
+        .chat-message:nth-child(5n+2)::before { background: #38bfff; }
+        .chat-message:nth-child(5n+3)::before { background: #00e5a0; }
+        .chat-message:nth-child(5n+4)::before { background: #ffc130; }
+        .chat-message:nth-child(5n+5)::before { background: #b87fff; }
+
+        .chat-message.new {
+            animation: fadeSlideIn 0.3s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+        }
+
+        /* Compact mono badge */
+        .tech-badge {
+            font-family: 'Fira Code', monospace;
+            font-size: 9.5px;
+            font-weight: 500;
+            padding: 1px 5px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            color: rgba(255, 255, 255, 0.45);
+            border-radius: 4px;
+            text-transform: lowercase;
+            margin-right: 7px;
+            vertical-align: middle;
+            display: inline-block;
+            letter-spacing: 0.3px;
+        }
+
+        /* Author name */
+        .author {
+            font-weight: 700;
+            font-size: 15px;
+            letter-spacing: -0.2px;
+            margin-right: 5px;
+            vertical-align: middle;
+            display: inline-block;
+        }
+
+        .chat-message:nth-child(5n+1) .author { color: #ff4a7a; }
+        .chat-message:nth-child(5n+2) .author { color: #38bfff; }
+        .chat-message:nth-child(5n+3) .author { color: #00e5a0; }
+        .chat-message:nth-child(5n+4) .author { color: #ffc130; }
+        .chat-message:nth-child(5n+5) .author { color: #b87fff; }
+
+        .msg-text {
+            color: #e8eaf2;
+            font-size: 15px;
+            font-weight: 500;
+            letter-spacing: 0.05px;
+            vertical-align: middle;
+            display: inline;
+        }
+
+        /* Running command bar */
+        #running-cmd {
+            display: none;
+            font-family: 'Fira Code', monospace;
+            background: rgba(0, 20, 14, 0.75);
+            color: #00e5a0;
+            padding: 9px 14px;
+            font-weight: 400;
+            font-size: 11.5px;
+            border-radius: 8px;
+            border: 1px solid rgba(0, 229, 160, 0.18);
+            box-shadow: 0 0 16px rgba(0, 229, 160, 0.06);
+            letter-spacing: 0.2px;
+        }
+
+        #running-cmd::before {
+            content: "▸ ";
+            color: rgba(0, 229, 160, 0.5);
+            font-weight: 700;
+        }
+
+        /* Cooldown countdown pills — shown above the chat feed while
+           !revert / !restart are on cooldown. Hidden entirely (not just
+           faded) when there's nothing to show, so they never take up
+           space or look like an empty placeholder. */
+        #cooldowns {
+            display: none;
+            flex-direction: column;
+            gap: 10px;
+            margin-bottom: 4px;
+        }
+
+        #cooldowns.visible { display: flex; }
+
+        .cooldown-pill {
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            font-family: 'Fira Code', monospace;
+            font-size: 20px;
+            font-weight: 600;
+            padding: 14px 18px;
+            border-radius: 12px;
+            letter-spacing: 0.2px;
+            background: rgba(14, 15, 18, 0.85);
+            border: 2px solid currentColor;
+            box-shadow: 0 4px 28px rgba(0, 0, 0, 0.45), 0 0 22px currentColor;
+        }
+
+        .cooldown-pill.active { display: flex; }
+
+        .cooldown-pill .cd-label {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: #ffffff;
+        }
+
+        .cooldown-pill .cd-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: var(--cd-accent);
+            box-shadow: 0 0 10px var(--cd-accent);
+            flex-shrink: 0;
+            animation: pulseDot 1.2s ease-in-out infinite;
+        }
+
+        @keyframes pulseDot {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50%      { opacity: 0.5; transform: scale(0.8); }
+        }
+
+        #cooldown-revert  { color: #38bfff; --cd-accent: #38bfff; }
+        #cooldown-restart { color: #00e5a0; --cd-accent: #00e5a0; }
+
+        .cooldown-pill .cd-time {
+            font-weight: 800;
+            font-size: 24px;
+            font-variant-numeric: tabular-nums;
+            color: var(--cd-accent);
+        }
+
+        @keyframes fadeSlideIn {
+            0% {
+                opacity: 0;
+                transform: translateY(6px) scale(0.99);
+            }
+            100% {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="chat-container">
+        <div id="cooldowns">
+            <div class="cooldown-pill" id="cooldown-revert">
+                <span class="cd-label"><span class="cd-dot"></span>Revert cooldown</span>
+                <span class="cd-time" id="cooldown-revert-time">0s</span>
+            </div>
+            <div class="cooldown-pill" id="cooldown-restart">
+                <span class="cd-label"><span class="cd-dot"></span>Restart cooldown</span>
+                <span class="cd-time" id="cooldown-restart-time">0s</span>
+            </div>
+        </div>
+        <div id="messages-list"></div>
+        <div id="running-cmd"></div>
+    </div>
+
+    <script>
+        async function refresh() {
+            try {
+                const res = await fetch('overlay.json?v=' + Date.now(), {
+                    cache: "no-store",
+                    headers: { 'Cache-Control': 'no-cache' }
+                });
+                if (!res.ok) return;
+                const data = await res.json();
+                if (!data?.chat) return;
+
+                updateCooldowns(data);
+
+                const cmdEl = document.getElementById('running-cmd');
+                if (data.running_command) {
+                    cmdEl.textContent = data.running_command;
+                    cmdEl.style.display = 'block';
+                } else {
+                    cmdEl.style.display = 'none';
+                }
+
+                const list = document.getElementById('messages-list');
+                const currentIds = new Set();
+
+                data.chat.forEach(msg => {
+                    const id = msg.id;
+                    currentIds.add(id);
+
+                    let el = document.getElementById(id);
+                    if (!el) {
+                        el = document.createElement('div');
+                        el.className = 'chat-message new';
+                        el.id = id;
+                        el.innerHTML = `
+                            <span class="author">${escapeHtml(msg.author)}:</span>
+                            <span class="msg-text">${escapeHtml(msg.message)}</span>
+                        `;
+                        list.appendChild(el);
+                        setTimeout(() => el.classList.remove('new'), 350);
+                    } else {
+                        const authorSpan = el.querySelector('.author');
+                        const textSpan = el.querySelector('.msg-text');
+                        if (authorSpan && authorSpan.textContent !== msg.author + ':') authorSpan.textContent = msg.author + ':';
+                        if (textSpan && textSpan.textContent !== msg.message) textSpan.textContent = msg.message;
+                    }
+                });
+
+                Array.from(list.children).forEach(child => {
+                    if (!currentIds.has(child.id)) child.remove();
+                });
+
+            } catch (e) {
+                console.error("Refresh error:", e);
+            }
+        }
+
+        function escapeHtml(str) {
+            return str
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;");
+        }
+
+        function formatSeconds(s) {
+            if (s >= 60) {
+                const m = Math.floor(s / 60);
+                const r = s % 60;
+                return `${m}m ${r}s`;
+            }
+            return `${s}s`;
+        }
+
+        function updateCooldowns(data) {
+            const revertSecs  = data.revert_cooldown_remaining  || 0;
+            const restartSecs = data.restart_cooldown_remaining || 0;
+
+            const revertPill  = document.getElementById('cooldown-revert');
+            const restartPill = document.getElementById('cooldown-restart');
+            const revertTime  = document.getElementById('cooldown-revert-time');
+            const restartTime = document.getElementById('cooldown-restart-time');
+            const wrap        = document.getElementById('cooldowns');
+
+            revertPill.classList.toggle('active', revertSecs > 0);
+            restartPill.classList.toggle('active', restartSecs > 0);
+            wrap.classList.toggle('visible', revertSecs > 0 || restartSecs > 0);
+
+            if (revertSecs > 0)  revertTime.textContent  = formatSeconds(revertSecs);
+            if (restartSecs > 0) restartTime.textContent = formatSeconds(restartSecs);
+        }
+
+        setInterval(refresh, 400);
+        refresh();
+    </script>
+</body>
+</html>
