@@ -224,7 +224,7 @@ def _is_admin():
 
 
 # ========================= VERSION & UPDATE CHECK =========================
-VERSION = "32.0.0"   # increment this with every release
+VERSION = "32.1.0"   # increment this with every release
 
 # Raw URL of version.json in your repo, and the page to send users to
 # when a newer version is available.
@@ -7066,64 +7066,183 @@ class YouTubeChatBotSecondary:
 
 
 # ========================= STDOUT REDIRECT =========================
+_CONSOLE_MAX_LINES = 2000      # oldest lines are trimmed beyond this
+_CONSOLE_MAX_LINE_LEN = 2000   # very long lines are truncated
+_CONSOLE_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+# Emoji / non-BMP characters, zero-width characters and variation selectors
+# are rendered badly by Tk (overlapping glyphs, odd spacing), so drop them.
+_CONSOLE_BAD_CHARS_RE = re.compile(
+    '[\U00010000-\U0010FFFF\u200b-\u200f\u2028\u2029\u2060\ufeff\ufe0e\ufe0f]')
+_CONSOLE_CTRL_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def _console_insert(widget, text):
+    """Append text to a read-only Text widget (main thread only).
+    Trims old lines and only auto-scrolls when the view is at the bottom."""
+    if not text:
+        return
+    try:
+        if not widget.winfo_exists():
+            return
+        at_bottom = widget.yview()[1] >= 0.999
+        widget.configure(state='normal')
+        widget.insert('end', text)
+        total = int(widget.index('end-1c').split('.')[0])
+        if total > _CONSOLE_MAX_LINES:
+            widget.delete('1.0', f'{total - _CONSOLE_MAX_LINES + 1}.0')
+        widget.configure(state='disabled')
+        if at_bottom:
+            widget.see('end')
+    except Exception:
+        pass
+
+
 class ConsoleRedirect:
-    """Redirects stdout/stderr to a Tkinter ScrolledText widget."""
+    """Redirects stdout/stderr to a Tkinter ScrolledText widget.
+
+    Thread-safe design:
+      * Every thread has its own partial-line buffer, so text printed by
+        different threads can never be interleaved inside one line.
+      * Complete lines are pushed to a queue; only the Tk main thread
+        touches the widget (a poller drains the queue in batches).
+      * Lines are sanitized (ANSI codes, tabs, control chars, emoji, blank
+        lines) and the widget is trimmed to a fixed number of lines.
+    """
+    POLL_MS = 50
+    MAX_BATCH = 400          # lines inserted per poll tick
+    PARTIAL_FLUSH_SEC = 0.6  # flush a line that never got its newline
+
     def __init__(self, widget):
-        self.widget = widget
-        self._orig_stdout = sys.stdout
-        self._orig_stderr = sys.stderr
+        self.widget        = widget
+        self._orig_stdout  = sys.stdout
+        self._orig_stderr  = sys.stderr
+        self._queue        = queue.SimpleQueue()
+        self._partial      = {}   # thread id -> (text, last_write_time)
+        self._plock        = threading.Lock()
+        self._poll_job     = None
+        self._active       = False
+
+    # ---- producer side (any thread) ----
+    @staticmethod
+    def _clean(line):
+        if "\r" in line:
+            segs = [s for s in line.split("\r") if s.strip()]
+            line = segs[-1] if segs else ""
+        line = _CONSOLE_ANSI_RE.sub("", line)
+        line = _CONSOLE_BAD_CHARS_RE.sub("", line)
+        line = _CONSOLE_CTRL_RE.sub("", line)
+        line = line.expandtabs(4).rstrip()
+        if len(line) > _CONSOLE_MAX_LINE_LEN:
+            line = line[:_CONSOLE_MAX_LINE_LEN] + " ..."
+        return line
+
+    def _enqueue(self, text):
+        ts = time.strftime("%H:%M:%S")
+        first = True
+        for raw in text.split("\n"):
+            line = self._clean(raw)
+            if not line.strip():
+                continue   # never show blank lines
+            prefix = f"[{ts}] " if first else "           "
+            first = False
+            self._queue.put(prefix + line + "\n")
 
     def write(self, msg):
-        self._orig_stdout.write(msg)
-        # Schedule the widget update on the main thread (Tkinter is not thread-safe).
-        # Guard against the widget being destroyed after the bot stops.
-        # Skip bare newline messages — they are the second call that Python's print()
-        # makes after writing the actual text, and they would produce "[HH:MM:SS] \n"
-        # as a spurious blank timestamped line in the console.
-        if not msg or msg == "\n":
-            def _update_nl(m=msg):
-                try:
-                    widget = self.widget
-                    if widget.winfo_exists():
-                        widget.configure(state='normal')
-                        widget.insert('end', m)
-                        widget.see('end')
-                        widget.configure(state='disabled')
-                except Exception:
-                    pass
-            try:
-                self.widget.after(0, _update_nl)
-            except Exception:
-                pass
+        if not msg:
             return
+        if not isinstance(msg, str):
+            msg = str(msg)
         try:
-            widget = self.widget
-            if not widget.winfo_exists():
-                return
-            ts = time.strftime("%H:%M:%S")
-            formatted = f"[{ts}] {msg}"
-            def _update(m=formatted):
-                try:
-                    if widget.winfo_exists():
-                        widget.configure(state='normal')
-                        widget.insert('end', m)
-                        widget.see('end')
-                        widget.configure(state='disabled')
-                except Exception:
-                    pass
-            widget.after(0, _update)
+            if self._orig_stdout is not None:
+                self._orig_stdout.write(msg)
         except Exception:
             pass
+        key = threading.get_ident()
+        with self._plock:
+            buf = self._partial.get(key, ("", 0))[0] + msg.replace("\r\n", "\n")
+            parts = buf.split("\n")
+            tail = parts.pop()
+            if tail:
+                self._partial[key] = (tail, time.time())
+            else:
+                self._partial.pop(key, None)
+        for line in parts:
+            self._enqueue(line)
 
-    def flush(self): pass
+    def log_line(self, msg):
+        """Used by the GUI's own _log() so ordering stays consistent."""
+        self._enqueue(str(msg))
+
+    def flush(self):
+        pass
+
+    # ---- consumer side (Tk main thread) ----
+    def _flush_stale_partials(self, force=False):
+        now = time.time()
+        stale = []
+        with self._plock:
+            for key, (text, ts) in list(self._partial.items()):
+                if force or now - ts >= self.PARTIAL_FLUSH_SEC:
+                    stale.append(text)
+                    del self._partial[key]
+        for text in stale:
+            self._enqueue(text)
+
+    def _drain(self, limit=None):
+        chunks = []
+        count = 0
+        while limit is None or count < limit:
+            try:
+                chunks.append(self._queue.get_nowait())
+            except Exception:
+                break
+            count += 1
+        if chunks:
+            _console_insert(self.widget, "".join(chunks))
+
+    def _poll(self):
+        self._poll_job = None
+        if not self._active:
+            return
+        try:
+            if not self.widget.winfo_exists():
+                self._active = False
+                return
+            self._flush_stale_partials()
+            self._drain(self.MAX_BATCH)
+            self._poll_job = self.widget.after(self.POLL_MS, self._poll)
+        except Exception:
+            self._poll_job = None
 
     def start(self):
         sys.stdout = self
         sys.stderr = self
+        if not self._active:
+            self._active = True
+            try:
+                self._poll_job = self.widget.after(self.POLL_MS, self._poll)
+            except Exception:
+                self._poll_job = None
 
     def stop(self):
-        sys.stdout = self._orig_stdout
-        sys.stderr = self._orig_stderr
+        if sys.stdout is self:
+            sys.stdout = self._orig_stdout
+        if sys.stderr is self:
+            sys.stderr = self._orig_stderr
+        was_active = self._active
+        self._active = False
+        if self._poll_job is not None:
+            try:
+                self.widget.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+        if was_active:
+            try:
+                self._flush_stale_partials(force=True)
+                self._drain()
+            except Exception:
+                pass
 
 
 # ========================= GUI =========================
@@ -10525,7 +10644,8 @@ class NexovativeControlCenter:
             insertbackground=self.CONTEXT,
             selectbackground=self.ACCENT,
             relief="flat", bd=0, state='disabled',
-            wrap='word'
+            wrap='word', spacing1=0, spacing2=0, spacing3=0,
+            undo=False, tabs=("4c",)
         )
         self._console.pack(fill="both", expand=True, padx=1, pady=1)
 
@@ -12317,11 +12437,15 @@ class NexovativeControlCenter:
         return name in tkfont.families()
 
     def _log(self, msg):
-        self._console.configure(state='normal')
+        redir = getattr(self, '_console_redir', None)
+        if redir is not None:
+            # Same queue as stdout, so ordering is always preserved.
+            redir.log_line(msg)
+            return
         ts = time.strftime("%H:%M:%S")
-        self._console.insert('end', f"[{ts}] {msg}\n")
-        self._console.see('end')
-        self._console.configure(state='disabled')
+        text = ConsoleRedirect._clean(str(msg))
+        if text.strip():
+            _console_insert(self._console, f"[{ts}] {text}\n")
 
     def _mark_dirty(self, tab_idx):
         """Mark a tab as having unsaved changes."""
